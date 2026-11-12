@@ -52,6 +52,8 @@ async function runPythonTool(args) {
     const { stdout } = await execFileAsync(PYTHON_EXE, [SCRIPT_PATH, ...args], {
       timeout: 90000,
       maxBuffer: 10 * 1024 * 1024,
+      encoding: "utf8",
+      env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
       windowsHide: true,
     });
     const trimmed = stdout.trim();

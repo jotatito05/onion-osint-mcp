@@ -51,6 +51,10 @@ AHMIA_CLEAR_BASE = "https://ahmia.fi"
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; rv:128.0) Gecko/20100101 Firefox/128.0"
 ONION_V3_REGEX = re.compile(r"\b([a-z2-7]{56}\.onion)\b", re.IGNORECASE)
+HEADER_CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([a-zA-Z0-9._\-]+)", re.IGNORECASE)
+META_CHARSET_RE = re.compile(
+    rb"<meta[^>]+charset\s*=\s*[\"']?\s*([a-zA-Z0-9._\-]+)", re.IGNORECASE
+)
 
 
 # ============================================================================
@@ -468,11 +472,78 @@ def _assess_reliability(
     }
 
 
-def _extract_html_Text(html: str, current_url: str, max_chars: int = 8000) -> dict[str, Any]:
+def _decode_html_bytes(
+    raw_bytes: bytes,
+    content_type_header: str | None = None,
+    apparent_encoding: str | None = None,
+) -> tuple[str, str]:
+    """
+    Decodifica bytes HTML evitando el fallback RFC 2616 de `requests` (`ISO-8859-1` cuando
+    `Content-Type: text/html` no incluye `; charset=...`, lo que corrompe UTF-8 como 'Español' -> 'EspaÃ±ol').
+
+    Orden de prioridad:
+      1. `charset=` declarado explícitamente en la cabecera HTTP `Content-Type`.
+      2. `<meta charset="...">` o `<meta http-equiv="Content-Type" content="...charset=...">` en los primeros 4 KB.
+      3. Decodificación estricta `utf-8-sig` / `utf-8`.
+      4. `apparent_encoding` (chardet / charset_normalizer) o fallback `iso-8859-1`.
+    """
+    candidates: list[str] = []
+
+    if content_type_header:
+        m_hdr = HEADER_CHARSET_RE.search(content_type_header)
+        if m_hdr:
+            candidates.append(m_hdr.group(1).strip())
+
+    head_sample = raw_bytes[:4096]
+    m_meta = META_CHARSET_RE.search(head_sample)
+    if m_meta:
+        try:
+            meta_enc = m_meta.group(1).decode("ascii", errors="ignore").strip()
+            if meta_enc and meta_enc not in candidates:
+                candidates.append(meta_enc)
+        except Exception:
+            pass
+
+    for utf_enc in ("utf-8-sig", "utf-8"):
+        if utf_enc not in candidates:
+            candidates.append(utf_enc)
+
+    if apparent_encoding and apparent_encoding not in candidates:
+        candidates.append(apparent_encoding)
+
+    for enc in candidates:
+        try:
+            decoded = raw_bytes.decode(enc, errors="strict")
+            norm_enc = "utf-8" if enc == "utf-8-sig" else enc.lower()
+            return decoded, norm_enc
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    return raw_bytes.decode("iso-8859-1", errors="replace"), "iso-8859-1"
+
+
+def _decode_response_html(resp: requests.Response) -> tuple[str, str]:
+    """Extrae el HTML decodificado correctamente y el nombre de la codificación efectiva."""
+    raw = resp.content
+    ct = resp.headers.get("Content-Type", "") if resp.headers else ""
+    apparent = getattr(resp, "apparent_encoding", None)
+    return _decode_html_bytes(raw, content_type_header=ct, apparent_encoding=apparent)
+
+
+def _extract_html_Text(
+    html: str | bytes,
+    current_url: str,
+    max_chars: int = 8000,
+    content_type_header: str | None = None,
+) -> dict[str, Any]:
     """
     Extrae texto visible y enlaces de un documento HTML eliminando scripts, iframes y formularios.
-    Separado como función pura para facilitar pruebas sin red con HTML simulado.
+    Acepta tanto `bytes` (decodificando vía `_decode_html_bytes`) como `str`.
     """
+    detected_encoding = "utf-8"
+    if isinstance(html, bytes):
+        html, detected_encoding = _decode_html_bytes(html, content_type_header=content_type_header)
+
     soup = BeautifulSoup(html, "html.parser")
     forms_detected = len(soup.find_all("form"))
     password_inputs = len(soup.select("input[type=password]"))
@@ -492,6 +563,7 @@ def _extract_html_Text(html: str, current_url: str, max_chars: int = 8000) -> di
 
     return {
         "title": title,
+        "encoding": detected_encoding,
         "security_meta": {
             "passive_mode": True,
             "forms_stripped": forms_detected,
@@ -512,7 +584,8 @@ def _query_ahmia(
 ) -> list[dict[str, Any]]:
     home_resp = session.get(f"{base_url}/", timeout=22)
     home_resp.raise_for_status()
-    soup_home = BeautifulSoup(home_resp.text, "html.parser")
+    home_html, _ = _decode_response_html(home_resp)
+    soup_home = BeautifulSoup(home_html, "html.parser")
 
     params: dict[str, Any] = {"q": query}
     for inp in soup_home.select("form#searchForm input[type=hidden]"):
@@ -525,7 +598,8 @@ def _query_ahmia(
 
     search_resp = session.get(f"{base_url}/search/", params=params, timeout=28)
     search_resp.raise_for_status()
-    soup = BeautifulSoup(search_resp.text, "html.parser")
+    search_html, _ = _decode_response_html(search_resp)
+    soup = BeautifulSoup(search_html, "html.parser")
 
     items = soup.select("li.result")
     parsed: list[dict[str, Any]] = []
@@ -800,7 +874,13 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
         effective_proxy = _resolve_effective_proxy(session, url)
 
         resp = session.get(url, timeout=35, allow_redirects=True)
-        extracted = _extract_html_Text(resp.text, resp.url, max_chars=max_chars)
+        ct_header = resp.headers.get("Content-Type", "") if resp.headers else ""
+        extracted = _extract_html_Text(
+            resp.content,
+            resp.url,
+            max_chars=max_chars,
+            content_type_header=ct_header,
+        )
 
         return {
             "ok": True,
@@ -809,6 +889,7 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
             "requested_url": url,
             "final_url": resp.url,
             "status_code": resp.status_code,
+            "encoding": extracted["encoding"],
             "title": extracted["title"],
             "elapsed_seconds": round(time.time() - started_at, 2),
             "security_meta": extracted["security_meta"],

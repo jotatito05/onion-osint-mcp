@@ -138,6 +138,28 @@ class TestOnionOsint(unittest.TestCase):
         self.assertTrue(parsed["security_meta"]["credential_prompt_detected"])
         self.assertEqual(len(parsed["links_sample"]), 1)
 
+    def test_utf8_html_without_http_charset_does_not_produce_mojibake(self) -> None:
+        """
+        Reproduce el fallo de RFC 2616 en requests donde 'Content-Type: text/html' sin charset
+        fuerza ISO-8859-1 y convierte 'Español' en 'EspaÃ±ol'.
+        """
+        raw_utf8_html = (
+            "<!doctype html><html><head><meta charset=\"utf-8\"><title>Tor Project | Privacidad</title></head>"
+            "<body><p>Idiomas disponibles: Español, Français, Deutsch, Русский, 日本語</p>"
+            "<a href=\"/es/\">Español</a></body></html>"
+        ).encode("utf-8")
+
+        onion_url = "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3zzui5du4xyclen53wid.onion/"
+        parsed = oom._extract_html_Text(
+            raw_utf8_html,
+            onion_url,
+            content_type_header="text/html",
+        )
+        self.assertEqual(parsed["encoding"], "utf-8")
+        self.assertIn("Español", parsed["text_excerpt"])
+        self.assertNotIn("EspaÃ±ol", parsed["text_excerpt"])
+        self.assertEqual(parsed["links_sample"][0]["text"], "Español")
+
 
 if __name__ == "__main__":
     unittest.main()
