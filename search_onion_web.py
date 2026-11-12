@@ -29,13 +29,15 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import warnings
 from pathlib import Path
 from typing import Any
 
 import requests
+import urllib3
 from bs4 import BeautifulSoup
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ONION_INDEX_DB", str(BASE_DIR / "onion_index.db")))
@@ -100,19 +102,30 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "name": "read_onion_page",
         "description": (
             "Realiza una lectura estrictamente pasiva (HTTP GET) de una URL .onion a través del proxy "
-            "SOCKS5h de Tor. Elimina scripts, iframes y formularios de credenciales por seguridad OSINT."
+            "SOCKS5h de Tor. Elimina scripts, iframes y formularios de credenciales por seguridad OSINT. "
+            "Distingue en 'status' entre 'completed', 'tls_error' (certificado autofirmado en redirección HTTPS), "
+            "'timeout' y 'connection_failed'."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "URL completa http://<direccion_v3>.onion/...",
+                    "description": "URL completa http(s)://<direccion_v3>.onion/...",
                 },
                 "max_chars": {
                     "type": "integer",
                     "description": "Longitud máxima del texto extraído (por defecto 8000).",
                     "default": 8000,
+                },
+                "verify_tls": {
+                    "type": "boolean",
+                    "description": (
+                        "Si es true (por defecto), verifica certificados TLS y reporta 'status': 'tls_error' "
+                        "ante certificados autofirmados. Si es false, permite leer servicios .onion v3 con "
+                        "certificado HTTPS autofirmado."
+                    ),
+                    "default": True,
                 },
             },
             "required": ["url"],
@@ -352,11 +365,17 @@ def ensure_tor_proxy(timeout_sec: int = 45) -> tuple[str, bool]:
         )
 
     TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tor_log_path = TOR_DATA_DIR / "tor.log"
     creationflags = 0
     if sys.platform == "win32":
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
 
     target_port = ports_to_check[0]
+    log_file = open(tor_log_path, "a", encoding="utf-8", errors="ignore")
     _TOR_PROC = subprocess.Popen(
         [
             str(tor_exe),
@@ -365,27 +384,28 @@ def ensure_tor_proxy(timeout_sec: int = 45) -> tuple[str, bool]:
             "--DataDirectory",
             str(TOR_DATA_DIR),
         ],
-        stdout=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
-        text=True,
         creationflags=creationflags,
+         start_new_session=(sys.platform != "win32"),
     )
 
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         if _TOR_PROC.poll() is not None:
             break
-        line = _TOR_PROC.stdout.readline() if _TOR_PROC.stdout else ""
-        if "Bootstrapped 100%" in line:
-            return f"socks5h://127.0.0.1:{target_port}", True
-        if _is_port_open("127.0.0.1", target_port) and "Bootstrapped" in line and any(
-            pct in line for pct in ("80%", "85%", "90%", "95%", "100%")
-        ):
-            time.sleep(1.0)
-            return f"socks5h://127.0.0.1:{target_port}", True
+        if _is_port_open("127.0.0.1", target_port):
+            try:
+                log_tail = tor_log_path.read_text(encoding="utf-8", errors="ignore")[-4096:]
+                if "Bootstrapped 100%" in log_tail:
+                    return f"socks5h://127.0.0.1:{target_port}", False
+            except OSError:
+                pass
+        time.sleep(0.5)
 
     if _is_port_open("127.0.0.1", target_port):
-        return f"socks5h://127.0.0.1:{target_port}", True
+        return f"socks5h://127.0.0.1:{target_port}", False
 
     raise RuntimeError(f"Timeout esperando bootstrap de Tor en 127.0.0.1:{target_port}")
 
@@ -851,10 +871,66 @@ def search_onion_web(
     }
 
 
-def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
+def _classify_request_exception(exc: Exception) -> tuple[str, str, str | None]:
+    """
+    Clasifica una excepción de `requests` en `(status, error_type, hint)` para que
+    los agentes distingan entre:
+      - Rechazo de certificado TLS (`tls_error` / `ssl_certificate_error`)
+      - Tiempo de espera agotado (`timeout`)
+      - Corte o fallo de conexión (`connection_failed` / `connection_error`)
+    """
+    if isinstance(exc, requests.exceptions.SSLError):
+        return (
+            "tls_error",
+            "ssl_certificate_error",
+            (
+                "El servicio .onion presentó un certificado TLS autofirmado o no verificable "
+                "(habitual al redirigir de HTTP a HTTPS dentro de Tor). Si deseas leer el "
+                "contenido pasivamente confiando en la autenticación Ed25519 del dominio .onion v3, "
+                "repite la llamada con verify_tls=False."
+            ),
+        )
+    if isinstance(exc, requests.exceptions.Timeout):
+        return (
+            "timeout",
+            "timeout",
+            "El circuito Tor o el servidor .onion agotó el tiempo de espera.",
+        )
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        msg_low = str(exc).lower()
+        if "ssl" in msg_low or "certificate_verify_failed" in msg_low or "cert" in msg_low:
+            return (
+                "tls_error",
+                "ssl_certificate_error",
+                (
+                    "El servicio .onion presentó un certificado TLS autofirmado o no verificable. "
+                    "Puedes repetir la lectura con verify_tls=False."
+                ),
+            )
+        return (
+            "connection_failed",
+            "connection_error",
+            "La conexión con el servicio .onion se interrumpió o fue rechazada.",
+        )
+    return ("connection_failed", type(exc).__name__, None)
+
+
+def read_onion_page(
+    url: str,
+    max_chars: int = 8000,
+    verify_tls: bool = True,
+) -> dict[str, Any]:
     """
     Realiza una lectura pasiva (HTTP GET) de una URL .onion a través del proxy SOCKS5h de Tor.
     Elimina scripts, estilos y formularios por seguridad operativa (OSINT pasivo).
+
+    Estados de retorno (`status`):
+      - `"completed"` (`ok: True`): Página leída y sanitizada correctamente.
+      - `"tls_error"` (`ok: False`, `error_type: "ssl_certificate_error"`): El servicio .onion
+        redirigió a HTTPS o usó TLS con certificado autofirmado/no verificable y `verify_tls=True`.
+      - `"timeout"` (`ok: False`, `error_type: "timeout"`): Tiempo de espera agotado en el circuito.
+      - `"connection_failed"` (`ok: False`, `error_type: "connection_error"`): Conexión cortada o rechazada.
+      - `"invalid_url"` (`ok: False`): URL fuera del ámbito `.onion`.
     """
     url = (url or "").strip()
     parsed = urllib.parse.urlparse(url)
@@ -862,6 +938,7 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
         return {
             "ok": False,
             "status": "invalid_url",
+            "error_type": "invalid_url",
             "error": "Por seguridad, read_onion_page solo acepta URLs http(s)://*.onion válidas.",
         }
 
@@ -873,7 +950,11 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
         session = _create_tor_session(proxy_url)
         effective_proxy = _resolve_effective_proxy(session, url)
 
-        resp = session.get(url, timeout=35, allow_redirects=True)
+        with warnings.catch_warnings():
+            if not verify_tls:
+                warnings.simplefilter("ignore", urllib3.exceptions.InsecureRequestWarning)
+            resp = session.get(url, timeout=35, allow_redirects=True, verify=verify_tls)
+
         ct_header = resp.headers.get("Content-Type", "") if resp.headers else ""
         extracted = _extract_html_Text(
             resp.content,
@@ -881,6 +962,7 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
             max_chars=max_chars,
             content_type_header=ct_header,
         )
+        extracted["security_meta"]["tls_verified"] = verify_tls if resp.url.startswith("https:") else None
 
         return {
             "ok": True,
@@ -897,14 +979,19 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
             "links_sample": extracted["links_sample"],
         }
     except Exception as e:
-        return {
+        status_code_str, err_type, hint = _classify_request_exception(e)
+        err_payload: dict[str, Any] = {
             "ok": False,
-            "status": "connection_failed",
+            "status": status_code_str,
+            "error_type": err_type,
             "proxy": effective_proxy or "unavailable",
             "requested_url": url,
             "elapsed_seconds": round(time.time() - started_at, 2),
             "error": str(e),
         }
+        if hint:
+            err_payload["hint"] = hint
+        return err_payload
     finally:
         _cleanup_tor_if_spawned(spawned)
 
@@ -979,6 +1066,7 @@ def run_native_python_mcp_server() -> None:
                     data = read_onion_page(
                         url=str(args.get("url", "")),
                         max_chars=int(args.get("max_chars", 8000)),
+                        verify_tls=bool(args.get("verify_tls", True)),
                     )
                 else:
                     raise ValueError(f"Herramienta desconocida: {tool_name}")
@@ -1043,8 +1131,13 @@ def main() -> None:
     )
 
     p_read = sub.add_parser("read", help="Lectura pasiva de una URL .onion")
-    p_read.add_argument("url", help="URL http://<v3>.onion/...")
+    p_read.add_argument("url", help="URL http(s)://<v3>.onion/...")
     p_read.add_argument("--max-chars", type=int, default=8000)
+    p_read.add_argument(
+        "--no-verify-tls",
+        action="store_true",
+        help="Permitir certificados TLS autofirmados en redirecciones https://*.onion",
+    )
 
     sub.add_parser("status", help="Verificar conexión con proxy SOCKS5 de Tor")
     sub.add_parser("mcp", help="Iniciar servidor MCP (Model Context Protocol) sobre stdio")
@@ -1059,7 +1152,11 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8")
 
     if args.cmd == "read":
-        out = read_onion_page(args.url, max_chars=args.max_chars)
+        out = read_onion_page(
+            args.url,
+            max_chars=args.max_chars,
+            verify_tls=not args.no_verify_tls,
+        )
     elif args.cmd == "search":
         out = search_onion_web(
             args.query,

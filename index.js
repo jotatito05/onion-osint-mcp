@@ -115,13 +115,17 @@ server.tool(
 
 server.tool(
   "read_onion_page",
-  "Realiza una lectura pasiva (HTTP GET) de una URL .onion a través del proxy SOCKS5h de Tor, eliminando scripts y formularios de credenciales por seguridad OSINT.",
+  "Realiza una lectura pasiva (HTTP GET) de una URL .onion a través del proxy SOCKS5h de Tor, eliminando scripts y formularios de credenciales por seguridad OSINT. Distingue en 'status' entre 'completed', 'tls_error' (certificado autofirmado), 'timeout' y 'connection_failed'.",
   {
-    url: z.string().describe("URL completa http://<v3_address>.onion/..."),
+    url: z.string().describe("URL completa http(s)://<v3_address>.onion/..."),
     max_chars: z.number().int().min(500).max(25000).optional().describe("Longitud máxima del texto extraído (por defecto 8000)"),
+    verify_tls: z.boolean().optional().describe("Por defecto true (reporta 'tls_error' ante certificados autofirmados). Si es false, permite leer servicios .onion con certificado HTTPS autofirmado."),
   },
-  async ({ url, max_chars }) => {
+  async ({ url, max_chars, verify_tls }) => {
     const cliArgs = ["read", url, "--max-chars", String(max_chars || 8000)];
+    if (verify_tls === false) {
+      cliArgs.push("--no-verify-tls");
+    }
     return runPythonTool(cliArgs);
   }
 );
