@@ -1,0 +1,15 @@
+{
+  "name": "onion-osint-mcp",
+  "version": "1.0.0",
+  "description": "MCP Server for Tor (.onion) OSINT & Threat Intelligence via SOCKS5 Proxy",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  }
+}
+

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onion-osint-mcp"
+version = "1.0.0"
+description = "Universal Tor (.onion) OSINT & Threat Intelligence Tool and MCP Server for Agentic AI"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+  { name = "JotaTito05", email = "jtiobar01@gmail.com" }
+]
+keywords = ["osint", "tor", "onion", "cybersecurity", "threat-intelligence", "mcp", "ai-agents", "cti"]
+dependencies = [
+  "requests>=2.31.0",
+  "PySocks>=1.7.1",
+  "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+onion-osint = "search_onion_web:main"
+
+[tool.setuptools]
+py-modules = ["search_onion_web"]
