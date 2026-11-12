@@ -20,3 +20,4 @@ COPY AGENTS.md .
 # Por defecto inicia el servidor MCP sobre stdio (levanta Tor automáticamente en 9050)
 ENTRYPOINT ["python", "search_onion_web.py"]
 CMD ["mcp"]
+

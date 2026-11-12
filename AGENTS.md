@@ -16,3 +16,4 @@ Este repositorio proporciona herramientas universales de **Ciberinteligencia (CT
    - Lectura 100 % pasiva (`GET`). Prohibido enviar credenciales, ejecutar payloads o interactuar con formularios `POST`.
 4. **Estructura del Informe:**
    - Tabla o lista estructurada con: Dominio/URL `.onion`, Resumen técnico del hallazgo, Último avistamiento (`last_seen`) y Nivel de fiabilidad (alertando sobre *clusters* de espejos o *keyword stuffing*).
+

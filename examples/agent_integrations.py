@@ -92,3 +92,4 @@ def get_langchain_tools():
 if __name__ == "__main__":
     print("Esquemas OpenAI listos:", len(get_openai_tools()), "herramientas")
     print("Esquemas Anthropic listos:", len(get_anthropic_tools()), "herramientas")
+

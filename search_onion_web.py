@@ -9,7 +9,7 @@ Compatible with:
   - Standalone CLI for Bash/Terminal Agents (OpenHands, SWE-agent, Aider)
 
 Core capabilities:
-  - search_onion_web(query: str, max_results: int = 20, days: int | None = None) -> dict
+  - search_onion_web(query: str, max_results: int = 20, days: int | None = None, local_only: bool = False) -> dict
   - read_onion_page(url: str, max_chars: int = 8000) -> dict
   - check_tor_status() -> dict
 """
@@ -35,7 +35,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ONION_INDEX_DB", str(BASE_DIR / "onion_index.db")))
@@ -63,7 +63,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Busca información pública, foros, documentación, actores de amenaza o menciones "
             "en servicios ocultos (.onion) de la red Tor a través de un proxy SOCKS5h seguro "
-            "(motores indexadores .onion como Ahmia + base de datos indexada local SQLite)."
+            "(motores indexadores .onion como Ahmia + base de datos indexada local SQLite). "
+            "Distingue explícitamente en 'status' entre búsqueda en vivo completada ('completed'), "
+            "consulta solo al índice local ('local_only') y fallo de conexión ('connection_failed')."
         ),
         "parameters": {
             "type": "object",
@@ -80,6 +82,11 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "days": {
                     "type": "integer",
                     "description": "Filtro opcional de antigüedad máxima en días (ej. 7 o 30).",
+                },
+                "local_only": {
+                    "type": "boolean",
+                    "description": "Si es true, consulta únicamente la base de datos SQLite indexada local sin conectar a Tor.",
+                    "default": False,
                 },
             },
             "required": ["query"],
@@ -248,6 +255,29 @@ def _is_port_open(host: str, port: int, timeout: float = 1.0) -> bool:
         return False
 
 
+def _create_tor_session(proxy_url: str) -> requests.Session:
+    """
+    Crea una sesión HTTP estrictamente aislada del entorno:
+      - `session.trust_env = False` impide que `requests` priorice variables de entorno
+        (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`) o el proxy del sistema/registro
+        de Windows por encima de `session.proxies`.
+      - Fuerza `socks5h://` para tanto `http` como `https` evitando fugas DNS.
+    """
+    session = requests.Session()
+    session.trust_env = False
+    session.proxies = {"http": proxy_url, "https": proxy_url}
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+
+def _resolve_effective_proxy(session: requests.Session, test_url: str = AHMIA_ONION_BASE) -> str | None:
+    """Devuelve el proxy efectivo que `requests` utilizará realmente para `test_url`."""
+    merged = session.merge_environment_settings(test_url, {}, None, None, None)
+    proxies = merged.get("proxies") or {}
+    scheme = urllib.parse.urlparse(test_url).scheme or "http"
+    return proxies.get(scheme) or proxies.get("all")
+
+
 def find_tor_executable() -> Path | None:
     """
     Busca el binario de Tor de forma multiplataforma (Windows, Linux, macOS).
@@ -368,26 +398,25 @@ def _cleanup_tor_if_spawned(spawned: bool) -> None:
 
 
 def check_tor_status() -> dict[str, Any]:
-    """Verifica conectividad con la red Tor y devuelve el nodo de salida actual."""
+    """Verifica conectividad con la red Tor usando sesión aislada (`trust_env=False`)."""
     spawned = False
     try:
         proxy_url, spawned = ensure_tor_proxy(timeout_sec=45)
-        resp = requests.get(
-            "https://check.torproject.org/api/ip",
-            proxies={"http": proxy_url, "https": proxy_url},
-            headers={"User-Agent": USER_AGENT},
-            timeout=20,
-        )
+        session = _create_tor_session(proxy_url)
+        effective_proxy = _resolve_effective_proxy(session, "https://check.torproject.org/api/ip")
+        resp = session.get("https://check.torproject.org/api/ip", timeout=20)
+        resp.raise_for_status()
         data = resp.json()
         return {
             "ok": True,
-            "proxy": proxy_url,
+            "status": "connected" if data.get("IsTor") else "not_tor",
+            "proxy": effective_proxy,
             "is_tor": data.get("IsTor", False),
             "exit_ip": data.get("IP"),
             "tor_binary": str(find_tor_executable() or "external_daemon"),
         }
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "status": "connection_failed", "error": str(e)}
     finally:
         _cleanup_tor_if_spawned(spawned)
 
@@ -402,12 +431,12 @@ def _assess_reliability(
     is_v3 = bool(ONION_V3_REGEX.search(onion_domain or ""))
     freshness = "desconocida"
     ls_lower = (last_seen or "").lower()
-    if any(u in ls_lower for u in ("minute", "hour", "minuto", "hora", "just now")):
-        freshness = "alta (<24h)"
+    if any(u in ls_lower for u in ("month", "mes", "year", "año")):
+        freshness = "baja (antiguo)"
     elif any(u in ls_lower for u in ("day", "día", "week", "semana")):
         freshness = "media (reciente)"
-    elif any(u in ls_lower for u in ("month", "mes", "year", "año")):
-        freshness = "baja (antiguo)"
+    elif any(u in ls_lower for u in ("minute", "hour", "minuto", "hora", "just now")):
+        freshness = "alta (<24h)"
 
     words = [w.lower() for w in re.findall(r"\w+", title or "") if len(w) > 3]
     spam_indicator = False
@@ -436,6 +465,40 @@ def _assess_reliability(
         "confidence": confidence,
         "SpamOrCloneSuspected": spam_indicator,
         "note": note,
+    }
+
+
+def _extract_html_Text(html: str, current_url: str, max_chars: int = 8000) -> dict[str, Any]:
+    """
+    Extrae texto visible y enlaces de un documento HTML eliminando scripts, iframes y formularios.
+    Separado como función pura para facilitar pruebas sin red con HTML simulado.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    forms_detected = len(soup.find_all("form"))
+    password_inputs = len(soup.select("input[type=password]"))
+
+    for tag in soup(["script", "style", "noscript", "iframe", "svg", "form"]):
+        tag.decompose()
+
+    title = soup.title.get_text(" ", strip=True) if soup.title else "Sin título"
+    text_content = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
+
+    links = []
+    for a in soup.select("a[href]")[:40]:
+        href = urllib.parse.urljoin(current_url, a["href"])
+        lbl = a.get_text(" ", strip=True)[:80]
+        if lbl or ".onion" in href:
+            links.append({"text": lbl, "href": href})
+
+    return {
+        "title": title,
+        "security_meta": {
+            "passive_mode": True,
+            "forms_stripped": forms_detected,
+            "credential_prompt_detected": password_inputs > 0,
+        },
+        "text_excerpt": text_content[:max_chars],
+        "links_sample": links[:25],
     }
 
 
@@ -519,83 +582,8 @@ def _query_ahmia(
     return parsed
 
 
-def search_onion_web(
-    query: str, max_results: int = 20, days: int | None = None
-) -> dict[str, Any]:
-    """
-    Busca términos, actores o IoCs en servicios ocultos (.onion) mediante proxy SOCKS5h de Tor
-    y en la base de datos indexada local SQLite.
-    """
-    query = (query or "").strip()
-    if not query:
-        return {"ok": False, "error": "El parámetro 'query' no puede estar vacío."}
-
-    started_at = time.time()
-    errors: list[str] = []
-    results: list[dict[str, Any]] = []
-    used_engine = "none"
-    proxy_url = None
-    spawned = False
-
-    try:
-        proxy_url, spawned = ensure_tor_proxy(timeout_sec=45)
-        session = requests.Session()
-        session.proxies.update({"http": proxy_url, "https": proxy_url})
-        session.headers.update({"User-Agent": USER_AGENT})
-
-        try:
-            results = _query_ahmia(
-                session,
-                AHMIA_ONION_BASE,
-                "ahmia_onion_v3",
-                query,
-                max_results=max_results,
-                days=days,
-            )
-            used_engine = "ahmia_onion_v3 (SOCKS5h -> .onion)"
-        except Exception as e_onion:
-            errors.append(f"Ahmia .onion timeout/error: {e_onion}")
-
-        if not results:
-            try:
-                results = _query_ahmia(
-                    session,
-                    AHMIA_CLEAR_BASE,
-                    "ahmia_tor_exit",
-                    query,
-                    max_results=max_results,
-                    days=days,
-                )
-                used_engine = "ahmia_tor_exit (SOCKS5h -> clearnet gateway)"
-            except Exception as e_clear:
-                errors.append(f"Ahmia Tor exit error: {e_clear}")
-
-    except Exception as e_tor:
-        errors.append(f"Tor SOCKS5 proxy error: {e_tor}")
-    finally:
-        _cleanup_tor_if_spawned(spawned)
-
-    if results:
-        try:
-            _save_to_local_index(results, query)
-        except Exception as e_db:
-            errors.append(f"Advertencia al guardar en índice local: {e_db}")
-
-    local_matches: list[dict[str, Any]] = []
-    try:
-        local_matches = _search_local_index(query, limit=max_results)
-    except Exception as e_local:
-        errors.append(f"Error consultando índice local: {e_local}")
-
-    existing_urls = {r["onion_url"] for r in results}
-    for lm in local_matches:
-        if lm["onion_url"] not in existing_urls and len(results) < max_results:
-            results.append(lm)
-            existing_urls.add(lm["onion_url"])
-            if used_engine == "none":
-                used_engine = "local_sqlite_index"
-
-    # Detección de clusters de espejos/clones
+def _annotate_mirror_clusters(results: list[dict[str, Any]]) -> None:
+    """Detecta y etiqueta clusters de dominios .onion espejo en un lote de resultados."""
     sig_counts: dict[str, int] = {}
     for r in results:
         parsed_u = urllib.parse.urlparse(r.get("onion_url", ""))
@@ -614,18 +602,177 @@ def search_onion_web(
                 f"Detectados {mirrors} dominios .onion distintos sirviendo exactamente la misma ruta y título (cluster de espejos)."
             )
 
+
+def search_onion_web(
+    query: str,
+    max_results: int = 20,
+    days: int | None = None,
+    local_only: bool = False,
+) -> dict[str, Any]:
+    """
+    Busca términos, actores o IoCs en servicios ocultos (.onion) mediante proxy SOCKS5h de Tor
+    y en la base de datos indexada local SQLite.
+
+    Estados de retorno (`status`):
+      - `"completed"` (`ok: True`, `live_tor_reached: True`):
+          La consulta en vivo a través de Tor se completó correctamente (con N o 0 resultados).
+      - `"local_only"` (`ok: True`, `live_tor_reached: False`):
+          Consulta servida exclusivamente desde la base de datos local SQLite (`onion_index.db`),
+          ya sea por `local_only=True` o como degradación controlada cuando Tor falló pero existen
+          registros locales cacheados (`degraded: True`).
+      - `"connection_failed"` (`ok: False`, `live_tor_reached: False`):
+          Falló la conexión/búsqueda en vivo por Tor y no hay resultados locales de respaldo.
+    """
+    query = (query or "").strip()
+    if not query:
+        return {
+            "ok": False,
+            "status": "invalid_query",
+            "live_tor_reached": False,
+            "error": "El parámetro 'query' no puede estar vacío.",
+        }
+
+    started_at = time.time()
+    errors: list[str] = []
+    results: list[dict[str, Any]] = []
+    used_engine = "none"
+    effective_proxy: str | None = None
+    live_tor_reached = False
+    spawned = False
+
+    if not local_only:
+        try:
+            proxy_url, spawned = ensure_tor_proxy(timeout_sec=45)
+            session = _create_tor_session(proxy_url)
+            effective_proxy = _resolve_effective_proxy(session, AHMIA_ONION_BASE)
+
+            # 1. Intentar servicio oculto .onion v3 nativo de Ahmia
+            try:
+                results = _query_ahmia(
+                    session,
+                    AHMIA_ONION_BASE,
+                    "ahmia_onion_v3",
+                    query,
+                    max_results=max_results,
+                    days=days,
+                )
+                live_tor_reached = True
+                used_engine = "ahmia_onion_v3 (SOCKS5h -> .onion)"
+            except Exception as e_onion:
+                errors.append(f"Ahmia .onion error: {e_onion}")
+
+            # 2. Fallback a pasarela Ahmia saliendo por nodo Tor (solo si falló el intento 1 o dio 0)
+            if not live_tor_reached or not results:
+                try:
+                    clear_results = _query_ahmia(
+                        session,
+                        AHMIA_CLEAR_BASE,
+                        "ahmia_tor_exit",
+                        query,
+                        max_results=max_results,
+                        days=days,
+                    )
+                    live_tor_reached = True
+                    if not results:
+                        results = clear_results
+                        used_engine = "ahmia_tor_exit (SOCKS5h -> clearnet gateway)"
+                except Exception as e_clear:
+                    errors.append(f"Ahmia Tor exit error: {e_clear}")
+
+        except Exception as e_tor:
+            errors.append(f"Tor SOCKS5 proxy error: {e_tor}")
+        finally:
+            _cleanup_tor_if_spawned(spawned)
+
+    # Persistir nuevos hallazgos en el índice local SQLite
+    if results:
+        try:
+            _save_to_local_index(results, query)
+        except Exception as e_db:
+            errors.append(f"Advertencia al guardar en índice local: {e_db}")
+
+    # Consultar índice local SQLite (como fuente exclusiva en local_only, o complemento/respaldo)
+    local_matches: list[dict[str, Any]] = []
+    try:
+        local_matches = _search_local_index(query, limit=max_results)
+    except Exception as e_local:
+        errors.append(f"Error consultando índice local: {e_local}")
+
+    existing_urls = {r["onion_url"] for r in results}
+    for lm in local_matches:
+        if lm["onion_url"] not in existing_urls and len(results) < max_results:
+            results.append(lm)
+            existing_urls.add(lm["onion_url"])
+
+    _annotate_mirror_clusters(results)
     elapsed = round(time.time() - started_at, 2)
     unique_domains = sorted({r["onion_domain"] for r in results if r.get("onion_domain")})
 
+    # Clasificación explícita de los 3 estados de respuesta
+    if local_only:
+        return {
+            "ok": True,
+            "status": "local_only",
+            "degraded": False,
+            "live_tor_reached": False,
+            "query": query,
+            "proxy": "none (local_only)",
+            "engine_used": "local_sqlite_index",
+            "elapsed_seconds": elapsed,
+            "total_results": len(results),
+            "unique_onion_domains": len(unique_domains),
+            "results": results,
+            "warnings": errors if errors else None,
+        }
+
+    if live_tor_reached:
+        return {
+            "ok": True,
+            "status": "completed",
+            "degraded": False,
+            "live_tor_reached": True,
+            "query": query,
+            "proxy": effective_proxy,
+            "engine_used": used_engine,
+            "elapsed_seconds": elapsed,
+            "total_results": len(results),
+            "unique_onion_domains": len(unique_domains),
+            "results": results,
+            "warnings": errors if errors else None,
+        }
+
+    # Si Tor falló pero la base de datos local tenía resultados cacheados para esta consulta
+    if results:
+        return {
+            "ok": True,
+            "status": "local_only",
+            "degraded": True,
+            "live_tor_reached": False,
+            "query": query,
+            "proxy": effective_proxy or "unavailable",
+            "engine_used": "local_sqlite_index (fallback)",
+            "elapsed_seconds": elapsed,
+            "total_results": len(results),
+            "unique_onion_domains": len(unique_domains),
+            "results": results,
+            "error": "No se pudo conectar a los motores en vivo de Tor; se devuelven coincidencias del índice local.",
+            "warnings": errors if errors else None,
+        }
+
+    # Fallo total de conexión a Tor y sin resultados en índice local: NO simular búsqueda vacía exitosa
     return {
-        "ok": True,
+        "ok": False,
+        "status": "connection_failed",
+        "degraded": True,
+        "live_tor_reached": False,
         "query": query,
-        "proxy": proxy_url or "offline_local_only",
-        "engine_used": used_engine,
+        "proxy": effective_proxy or "unavailable",
+        "engine_used": "none",
         "elapsed_seconds": elapsed,
-        "total_results": len(results),
-        "unique_onion_domains": len(unique_domains),
-        "results": results,
+        "total_results": 0,
+        "unique_onion_domains": 0,
+        "results": [],
+        "error": "Fallo al consultar la red Tor y no existen registros previos en el índice local.",
         "warnings": errors if errors else None,
     }
 
@@ -640,54 +787,39 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
     if parsed.scheme not in ("http", "https") or not parsed.hostname or not parsed.hostname.endswith(".onion"):
         return {
             "ok": False,
+            "status": "invalid_url",
             "error": "Por seguridad, read_onion_page solo acepta URLs http(s)://*.onion válidas.",
         }
 
     started_at = time.time()
     spawned = False
+    effective_proxy: str | None = None
     try:
         proxy_url, spawned = ensure_tor_proxy(timeout_sec=45)
-        session = requests.Session()
-        session.proxies.update({"http": proxy_url, "https": proxy_url})
-        session.headers.update({"User-Agent": USER_AGENT})
+        session = _create_tor_session(proxy_url)
+        effective_proxy = _resolve_effective_proxy(session, url)
 
         resp = session.get(url, timeout=35, allow_redirects=True)
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        forms_detected = len(soup.find_all("form"))
-        password_inputs = len(soup.select("input[type=password]"))
-
-        for tag in soup(["script", "style", "noscript", "iframe", "svg", "form"]):
-            tag.decompose()
-
-        title = soup.title.get_text(" ", strip=True) if soup.title else "Sin título"
-        text_content = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
-
-        links = []
-        for a in soup.select("a[href]")[:40]:
-            href = urllib.parse.urljoin(resp.url, a["href"])
-            lbl = a.get_text(" ", strip=True)[:80]
-            if lbl or ".onion" in href:
-                links.append({"text": lbl, "href": href})
+        extracted = _extract_html_Text(resp.text, resp.url, max_chars=max_chars)
 
         return {
             "ok": True,
+            "status": "completed",
+            "proxy": effective_proxy,
             "requested_url": url,
             "final_url": resp.url,
             "status_code": resp.status_code,
-            "title": title,
+            "title": extracted["title"],
             "elapsed_seconds": round(time.time() - started_at, 2),
-            "security_meta": {
-                "passive_mode": True,
-                "forms_stripped": forms_detected,
-                "credential_prompt_detected": password_inputs > 0,
-            },
-            "text_excerpt": text_content[:max_chars],
-            "links_sample": links[:25],
+            "security_meta": extracted["security_meta"],
+            "text_excerpt": extracted["text_excerpt"],
+            "links_sample": extracted["links_sample"],
         }
     except Exception as e:
         return {
             "ok": False,
+            "status": "connection_failed",
+            "proxy": effective_proxy or "unavailable",
             "requested_url": url,
             "elapsed_seconds": round(time.time() - started_at, 2),
             "error": str(e),
@@ -703,8 +835,6 @@ def read_onion_page(url: str, max_chars: int = 8000) -> dict[str, Any]:
 def run_native_python_mcp_server() -> None:
     """
     Servidor MCP (Model Context Protocol) ligero en Python puro sobre stdio.
-    Permite integrar la herramienta en Claude Desktop, Cursor, Windsurf, Antigravity,
-    Cline, OpenCode, etc. usando únicamente Python (`python search_onion_web.py mcp`).
     """
     if hasattr(sys.stdin, "reconfigure"):
         sys.stdin.reconfigure(encoding="utf-8")
@@ -762,6 +892,7 @@ def run_native_python_mcp_server() -> None:
                         query=str(args.get("query", "")),
                         max_results=int(args.get("max_results", 20)),
                         days=int(args["days"]) if args.get("days") is not None else None,
+                        local_only=bool(args.get("local_only", False)),
                     )
                 elif tool_name == "read_onion_page":
                     data = read_onion_page(
@@ -792,7 +923,10 @@ def run_native_python_mcp_server() -> None:
                         "content": [
                             {
                                 "type": "text",
-                                "text": json.dumps({"ok": False, "error": str(err)}, ensure_ascii=False),
+                                "text": json.dumps(
+                                    {"ok": False, "status": "error", "error": str(err)},
+                                    ensure_ascii=False,
+                                ),
                             }
                         ],
                         "isError": True,
@@ -821,6 +955,11 @@ def main() -> None:
     p_search.add_argument("query", help="Término de búsqueda o IoC")
     p_search.add_argument("--max-results", type=int, default=20)
     p_search.add_argument("--days", type=int, default=None)
+    p_search.add_argument(
+        "--local-only",
+        action="store_true",
+        help="Consultar únicamente la base de datos SQLite indexada local",
+    )
 
     p_read = sub.add_parser("read", help="Lectura pasiva de una URL .onion")
     p_read.add_argument("url", help="URL http://<v3>.onion/...")
@@ -841,7 +980,12 @@ def main() -> None:
     if args.cmd == "read":
         out = read_onion_page(args.url, max_chars=args.max_chars)
     elif args.cmd == "search":
-        out = search_onion_web(args.query, max_results=args.max_results, days=args.days)
+        out = search_onion_web(
+            args.query,
+            max_results=args.max_results,
+            days=args.days,
+            local_only=args.local_only,
+        )
     elif args.cmd == "status":
         out = check_tor_status()
     elif args.cmd == "schemas":

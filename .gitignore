@@ -18,3 +18,4 @@ onion_index.db-shm
 tor-osint-data/
 .env
 *.log
+

@@ -30,12 +30,12 @@ flowchart LR
 
 ### Características Clave
 
-1. **Sin Fugas DNS (`socks5h://`):** Todas las resoluciones de dominios `.onion` y el tráfico HTTP viajan íntegramente por el túnel SOCKS5h de Tor.
-2. **Auto-Bootstrap Multiplataforma:** Detecta automáticamente si existe un proxy Tor activo en `127.0.0.1:9050` o `9150`. Si no está activo, localiza el binario `tor` en Linux, macOS o Windows y levanta un circuito temporal automáticamente.
-3. **Triple Capa de Resiliencia:**
-   - Consulta primaria contra el nodo oculto `.onion` v3 de Ahmia (resolviendo dinámicamente su token anti-bot).
-   - Fallback automático por salida Tor si el circuito `.onion` presenta alta latencia.
-   - Persistencia y búsqueda en base de datos local SQLite (`onion_index.db`) para operar incluso ante caídas de indexadores.
+1. **Aislamiento Estricto de Proxy y Sin Fugas DNS (`socks5h://` + `trust_env = False`):** Ignora cualquier proxy HTTP/HTTPS del sistema o variables de entorno (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, registro de Windows) forzando que `requests` utilice exclusivamente el túnel SOCKS5h de Tor configurado.
+2. **Distinción Explícita de Estados (`status`):**
+   - `"completed"` (`ok: true`, `live_tor_reached: true`): Búsqueda en vivo completada a través de Tor (con `N` o `0` resultados reales).
+   - `"local_only"` (`ok: true`, `live_tor_reached: false`): Consulta servida desde el índice local SQLite (`onion_index.db`), indicando `degraded: true` cuando actúa como respaldo ante caída de Tor.
+   - `"connection_failed"` (`ok: false`, `live_tor_reached: false`, MCP `isError: true`): Fallo de conexión a Tor sin resultados locales, evitando que un agente confunda un error de red con una búsqueda vacía.
+3. **Auto-Bootstrap Multiplataforma:** Detecta automáticamente si existe un proxy Tor activo en `127.0.0.1:9050` o `9150`. Si no está activo, localiza el binario `tor` en Linux, macOS o Windows y levanta un circuito temporal automáticamente.
 4. **Heurística CTI de Fiabilidad y Clusters de Espejos:** Detecta automáticamente redes de espejos/clones (múltiples dominios `.onion` sirviendo idéntica ruta y título) y patrones de *keyword stuffing* o fraude.
 5. **Lectura Estrictamente Pasiva (`read_onion_page`):** Solo permite peticiones `HTTP GET` a dominios `.onion`, eliminando `<script>`, `<iframe>`, `<style>` y `<form>`, e informando si la página contiene formularios de credenciales sin interactuar con ellos.
 
@@ -198,3 +198,4 @@ Este proyecto ha sido desarrollado **exclusivamente para investigación defensiv
 - No realiza fuerza bruta, explotación ni envío de formularios (`POST`).
 - Sanitiza el DOM eliminando scripts activos y formularios antes de entregar el texto al modelo de lenguaje, mitigando vectores de *Indirect Prompt Injection* o ejecución no deseada.
 - El usuario es responsable de cumplir con la legislación aplicable y las políticas de su organización durante la investigación.
+

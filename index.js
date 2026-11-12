@@ -44,7 +44,7 @@ const PYTHON_EXE = resolvePythonExecutable();
 
 const server = new McpServer({
   name: "onion-osint",
-  version: "1.0.0",
+  version: "1.1.0",
 });
 
 async function runPythonTool(args) {
@@ -54,8 +54,19 @@ async function runPythonTool(args) {
       maxBuffer: 10 * 1024 * 1024,
       windowsHide: true,
     });
+    const trimmed = stdout.trim();
+    let isError = false;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed && parsed.ok === false) {
+        isError = true;
+      }
+    } catch {
+      // Si la salida no es JSON válido, conservar texto
+    }
     return {
-      content: [{ type: "text", text: stdout.trim() }],
+      isError,
+      content: [{ type: "text", text: trimmed }],
     };
   } catch (err) {
     return {
@@ -66,6 +77,7 @@ async function runPythonTool(args) {
           text: JSON.stringify(
             {
               ok: false,
+              status: "connection_failed",
               error: String(err.message || err),
               stderr: err.stderr ? String(err.stderr) : undefined,
             },
@@ -80,16 +92,20 @@ async function runPythonTool(args) {
 
 server.tool(
   "search_onion_web",
-  "Busca información pública, foros, documentación o menciones en servicios ocultos (.onion) de la red Tor a través de proxy SOCKS5h (Ahmia .onion + base de datos indexada local SQLite).",
+  "Busca información pública, foros, documentación o menciones en servicios ocultos (.onion) de la red Tor a través de proxy SOCKS5h (Ahmia .onion + base de datos indexada local SQLite). Distingue en 'status' entre 'completed', 'local_only' y 'connection_failed'.",
   {
     query: z.string().describe("Término de búsqueda, actor de amenaza, CVE o IoC a consultar en la red Tor (.onion)"),
     max_results: z.number().int().min(1).max(50).optional().describe("Número máximo de resultados a devolver (por defecto 20)"),
     days: z.number().int().min(1).max(365).optional().describe("Filtro opcional de antigüedad máxima en días (ej. 7 o 30)"),
+    local_only: z.boolean().optional().describe("Si es true, consulta únicamente la base de datos SQLite indexada local sin conectar a Tor"),
   },
-  async ({ query, max_results, days }) => {
+  async ({ query, max_results, days, local_only }) => {
     const cliArgs = ["search", query, "--max-results", String(max_results || 20)];
     if (days) {
       cliArgs.push("--days", String(days));
+    }
+    if (local_only) {
+      cliArgs.push("--local-only");
     }
     return runPythonTool(cliArgs);
   }
