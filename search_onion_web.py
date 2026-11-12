@@ -37,7 +37,7 @@ import requests
 import urllib3
 from bs4 import BeautifulSoup
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("ONION_INDEX_DB", str(BASE_DIR / "onion_index.db")))
@@ -103,8 +103,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "description": (
             "Realiza una lectura estrictamente pasiva (HTTP GET) de una URL .onion a través del proxy "
             "SOCKS5h de Tor. Elimina scripts, iframes y formularios de credenciales por seguridad OSINT. "
-            "Distingue en 'status' entre 'completed', 'tls_error' (certificado autofirmado en redirección HTTPS), "
-            "'timeout' y 'connection_failed'."
+            "Distingue en 'status' y 'page_type' entre una página de contenido real ('completed' / 'content'), "
+            "una cola de acceso anti-DDoS aunque devuelva HTTP 200 ('access_queue'), un reto CAPTCHA "
+            "('access_challenge'), un error de certificado ('tls_error'), 'timeout' y 'connection_failed'."
         ),
         "parameters": {
             "type": "object",
@@ -550,6 +551,89 @@ def _decode_response_html(resp: requests.Response) -> tuple[str, str]:
     return _decode_html_bytes(raw, content_type_header=ct, apparent_encoding=apparent)
 
 
+QUEUE_INDICATORS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("queue_phrase", re.compile(r"\b(you are in a queue|placed in a queue|access queue|waiting room|cola de acceso|sala de espera)\b", re.I)),
+    ("auto_redirect", re.compile(r"\b(redirect(?:ed)? automatically|automatically redirect|redirigir[aá] autom[aá]ticamente|please wait while we redirect)\b", re.I)),
+    ("browser_check", re.compile(r"\b(checking your browser|ddos protection|anti-ddos|endgame|one moment,?\s*please|just a moment)\b", re.I)),
+    ("queue_title", re.compile(r"^\s*(queue|waiting room|ddos protection|please wait|just a moment)\b", re.I)),
+)
+
+CHALLENGE_INDICATORS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("captcha_gate", re.compile(r"\b(solve the captcha|enter the captcha|verify you are human|human verification|complete the security check)\b", re.I)),
+    ("pow_gate", re.compile(r"\b(proof[- ]of[- ]work|computing challenge)\b", re.I)),
+)
+
+
+def _detect_access_gate(
+    soup: BeautifulSoup,
+    title: str,
+    text_content: str,
+    links_count: int,
+    meta_refresh: bool,
+) -> dict[str, Any]:
+    """
+    Distingue una cola de acceso / sala de espera anti-DDoS o reto CAPTCHA de una página
+    de contenido real, incluso cuando el servidor .onion responde con HTTP 200.
+    """
+    combined = f"{title}\n{text_content[:2500]}"
+    matched_queue: list[str] = []
+    for label, pattern in QUEUE_INDICATORS:
+        if pattern.search(combined):
+            matched_queue.append(label)
+
+    matched_challenge: list[str] = []
+    for label, pattern in CHALLENGE_INDICATORS:
+        if pattern.search(combined):
+            matched_challenge.append(label)
+
+    is_short_interstitial = len(text_content) < 2500 and links_count <= 6
+
+    # Caso 1: Cola de acceso / sala de espera con auto-redirección (ej. Dread queue)
+    if (meta_refresh and (matched_queue or is_short_interstitial)) or (
+        is_short_interstitial and len(matched_queue) >= 1 and (
+            "queue_phrase" in matched_queue
+            or "auto_redirect" in matched_queue
+            or "queue_title" in matched_queue
+            or len(matched_queue) >= 2
+        )
+    ):
+        if meta_refresh and "meta_refresh" not in matched_queue:
+            matched_queue.append("meta_refresh")
+        return {
+            "is_content_page": False,
+            "page_type": "access_queue",
+            "status": "access_queue",
+            "meta_refresh": meta_refresh,
+            "matched_indicators": matched_queue,
+            "note": (
+                "El servidor devolvió HTTP 200 pero el HTML corresponde a una cola de acceso / "
+                "sala de espera anti-DDoS con redirección automática, no a la página de contenido final."
+            ),
+        }
+
+    # Caso 2: Barrera CAPTCHA / verificación humana
+    if is_short_interstitial and matched_challenge:
+        return {
+            "is_content_page": False,
+            "page_type": "captcha_challenge",
+            "status": "access_challenge",
+            "meta_refresh": meta_refresh,
+            "matched_indicators": matched_challenge,
+            "note": (
+                "El servidor devolvió una barrera de verificación humana / CAPTCHA en lugar del contenido final."
+            ),
+        }
+
+    return {
+        "is_content_page": True,
+        "page_type": "content",
+        "status": "completed",
+        "meta_refresh": meta_refresh,
+        "matched_indicators": [],
+        "note": None,
+    }
+
+
 def _extract_html_Text(
     html: str | bytes,
     current_url: str,
@@ -558,7 +642,8 @@ def _extract_html_Text(
 ) -> dict[str, Any]:
     """
     Extrae texto visible y enlaces de un documento HTML eliminando scripts, iframes y formularios.
-    Acepta tanto `bytes` (decodificando vía `_decode_html_bytes`) como `str`.
+    Acepta tanto `bytes` (decodificando vía `_decode_html_bytes`) como `str`, e identifica
+    si el HTML corresponde a una cola de acceso (`access_queue`) o a contenido real (`content`).
     """
     detected_encoding = "utf-8"
     if isinstance(html, bytes):
@@ -567,6 +652,9 @@ def _extract_html_Text(
     soup = BeautifulSoup(html, "html.parser")
     forms_detected = len(soup.find_all("form"))
     password_inputs = len(soup.select("input[type=password]"))
+    meta_refresh = bool(
+        soup.find("meta", attrs={"http-equiv": re.compile(r"^\s*refresh\s*$", re.I)})
+    )
 
     for tag in soup(["script", "style", "noscript", "iframe", "svg", "form"]):
         tag.decompose()
@@ -581,13 +669,34 @@ def _extract_html_Text(
         if lbl or ".onion" in href:
             links.append({"text": lbl, "href": href})
 
+    gate_info = _detect_access_gate(
+        soup=soup,
+        title=title,
+        text_content=text_content,
+        links_count=len(links),
+        meta_refresh=meta_refresh,
+    )
+
     return {
         "title": title,
         "encoding": detected_encoding,
+        "page_type": gate_info["page_type"],
+        "is_content_page": gate_info["is_content_page"],
+        "gate_status": gate_info["status"],
+        "gate_details": (
+            {
+                "meta_refresh": gate_info["meta_refresh"],
+                "matched_indicators": gate_info["matched_indicators"],
+                "note": gate_info["note"],
+            }
+            if not gate_info["is_content_page"]
+            else None
+        ),
         "security_meta": {
             "passive_mode": True,
             "forms_stripped": forms_detected,
             "credential_prompt_detected": password_inputs > 0,
+            "meta_refresh_detected": meta_refresh,
         },
         "text_excerpt": text_content[:max_chars],
         "links_sample": links[:25],
@@ -963,10 +1072,13 @@ def read_onion_page(
             content_type_header=ct_header,
         )
         extracted["security_meta"]["tls_verified"] = verify_tls if resp.url.startswith("https:") else None
+        is_content = extracted["is_content_page"]
 
-        return {
-            "ok": True,
-            "status": "completed",
+        result_payload: dict[str, Any] = {
+            "ok": is_content,
+            "status": extracted["gate_status"],
+            "page_type": extracted["page_type"],
+            "is_content_page": is_content,
             "proxy": effective_proxy,
             "requested_url": url,
             "final_url": resp.url,
@@ -978,6 +1090,10 @@ def read_onion_page(
             "text_excerpt": extracted["text_excerpt"],
             "links_sample": extracted["links_sample"],
         }
+        if extracted["gate_details"]:
+            result_payload["gate_details"] = extracted["gate_details"]
+            result_payload["error"] = extracted["gate_details"]["note"]
+        return result_payload
     except Exception as e:
         status_code_str, err_type, hint = _classify_request_exception(e)
         err_payload: dict[str, Any] = {

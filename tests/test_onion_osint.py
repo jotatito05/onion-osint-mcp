@@ -218,10 +218,50 @@ class TestOnionOsint(unittest.TestCase):
             res = oom.read_onion_page(dread_url, verify_tls=False)
             self.assertTrue(res["ok"])
             self.assertEqual(res["status"], "completed")
+            self.assertEqual(res["page_type"], "content")
+            self.assertTrue(res["is_content_page"])
             self.assertFalse(res["security_meta"]["tls_verified"])
             mock_session.get.assert_called_once_with(
                 dread_url, timeout=35, allow_redirects=True, verify=False
             )
+
+    def test_read_onion_page_distinguishes_access_queue_from_content_on_http_200(self) -> None:
+        """
+        Verifica que una cola de acceso con HTTP 200 (como la de Dread) se reporta como
+        status='access_queue', page_type='access_queue', is_content_page=False y ok=False.
+        """
+        dread_url = "https://g66ol3eb5ujdckzqqfmjsbpdjufmjd5nsgdipvxmsh7rckzlhywlzlqd.onion/d/OpSec"
+        queue_html = (
+            b"<html><head><title>Dread - Queue</title>"
+            b"<meta http-equiv=\"refresh\" content=\"5\">"
+            b"</head><body><h1>DDoS Protection - Waiting Room</h1>"
+            b"<p>You have been placed in a queue. This page will automatically redirect you.</p>"
+            b"</body></html>"
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.url = dread_url
+        mock_resp.headers = {"Content-Type": "text/html; charset=utf-8"}
+        mock_resp.content = queue_html
+
+        mock_session = MagicMock()
+        mock_session.merge_environment_settings.return_value = {
+            "proxies": {"https": "socks5h://127.0.0.1:9050"}
+        }
+        mock_session.get.return_value = mock_resp
+
+        with patch.object(oom, "ensure_tor_proxy", return_value=("socks5h://127.0.0.1:9050", False)), \
+             patch.object(oom, "_create_tor_session", return_value=mock_session):
+            res = oom.read_onion_page(dread_url, verify_tls=False)
+            self.assertEqual(res["status_code"], 200)
+            self.assertFalse(res["ok"])
+            self.assertEqual(res["status"], "access_queue")
+            self.assertEqual(res["page_type"], "access_queue")
+            self.assertFalse(res["is_content_page"])
+            self.assertTrue(res["security_meta"]["meta_refresh_detected"])
+            self.assertIn("gate_details", res)
+            self.assertIn("auto_redirect", res["gate_details"]["matched_indicators"])
 
 
 if __name__ == "__main__":
