@@ -9,5 +9,8 @@ tests
 examples
 onion_index.db*
 onion_session.json*
+onion_sessions/
+*.windows/
+.session-*.tmp
 *.log
 .env

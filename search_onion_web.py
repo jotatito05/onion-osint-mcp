@@ -64,6 +64,7 @@ TOR_DATA_DIR = Path(
 
 AHMIA_ONION_BASE = "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion"
 AHMIA_CLEAR_BASE = "https://ahmia.fi"
+TOR_TAXI_URL = "http://tortaxi2dev6xjwbaydqzla77rrnth7yn2oqzjfmiuwn5h6vsk2a4syd.onion/"
 
 USER_AGENT = os.environ.get(
     "ONION_USER_AGENT",
@@ -117,6 +118,12 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "days": {
                     "type": "integer",
                     "description": "Filtro opcional de antigüedad máxima en días (ej. 7 o 30).",
+                },
+                "engines": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "description": "Motores por nombre: ahmia, tor-taxi, freshonions (si está configurado) o un motor del operador. Sin selección conserva Ahmia y las fuentes del operador.",
                 },
                 "local_only": {
                     "type": "boolean",
@@ -282,6 +289,14 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         },
     },
 ]
+
+
+for _tool in TOOL_DEFINITIONS:
+    if _tool["name"].startswith("onion_browser_") or _tool["name"] == "read_onion_page":
+        _tool["parameters"]["properties"]["window_id"] = {
+            "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$",
+            "description": "Identificador de la ventana y sus cookies. Si se omite, usa la sesión principal.",
+        }
 
 
 def get_openai_tools() -> list[dict[str, Any]]:
@@ -1287,11 +1302,127 @@ def _annotate_mirror_clusters(results: list[dict[str, Any]]) -> None:
             )
 
 
+def _search_ahmia_with_fallback(
+    session: requests.Session, query: str, max_results: int, days: int | None,
+    errors: list[str],
+) -> tuple[list[dict[str, Any]], str]:
+    for url, source, label in (
+        (AHMIA_ONION_BASE, "ahmia_onion_v3", "Ahmia .onion"),
+        (AHMIA_CLEAR_BASE, "ahmia_tor_exit", "Ahmia Tor exit"),
+    ):
+        try:
+            hits = _query_ahmia(session, url, source, query, max_results=max_results, days=days)
+            return hits, (
+                "ahmia_onion_v3 (SOCKS5h -> .onion)" if source == "ahmia_onion_v3"
+                else "ahmia_tor_exit (SOCKS5h -> clearnet gateway)"
+            )
+        except Exception as exc:
+            errors.append(f"{label} error: {exc}")
+    return [], "none"
+
+
+def _configured_search_engines() -> dict[str, str]:
+    """Carga endpoints JSON definidos por el operador, nunca por el agente."""
+    endpoints = json.loads(os.environ.get("ONION_SEARCH_ENGINES", "{}"))
+    if not isinstance(endpoints, dict) or len(endpoints) > 5:
+        raise ValueError("ONION_SEARCH_ENGINES debe ser un objeto con hasta cinco motores adicionales.")
+    for name, url in endpoints.items():
+        if name in {"ahmia", "local", "tor-taxi", "freshonions"} or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+            raise ValueError(f"Nombre de motor no válido: {name!r}.")
+        if not isinstance(url, str) or _onion_url_problem(url):
+            raise ValueError(f"El motor {name!r} requiere un endpoint HTTP(S) .onion v3 válido.")
+        parsed = urllib.parse.urlsplit(url)
+        _ = parsed.port  # urllib valida el rango y el formato del puerto aquí
+        if parsed.username is not None or parsed.password is not None or parsed.fragment:
+            raise ValueError(f"El endpoint de {name!r} no admite credenciales ni fragmentos.")
+    return endpoints
+
+
+def _query_json_engine(
+    session: requests.Session, endpoint: str, name: str, query: str,
+    max_results: int, days: int | None,
+) -> list[dict[str, Any]]:
+    fresh = name == "freshonions"
+    params: dict[str, Any] = {"search": query} if fresh else {"q": query, "limit": max_results}
+    if days is not None and not fresh:
+        params["days"] = days
+    data = json.loads(_fetch_engine_body(session, endpoint, params))
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        raise ValueError("El motor debe devolver un objeto con una lista results.")
+    rows = data["results"]
+    if fresh:
+        rows = [
+            {"onion_url": row.get("url"), "title": row.get("title"),
+             "snippet": BeautifulSoup(str(row.get("fragment") or ""), "html.parser").get_text(" ", strip=True)}
+            for row in rows if isinstance(row, dict)
+        ]
+    return _normalize_engine_results(rows, name, max_results)
+
+
+def _fetch_engine_body(session: requests.Session, endpoint: str, params: dict[str, Any] | None) -> bytes:
+    started_at = time.time()
+    with session.get(endpoint, params=params, timeout=(10, 20), stream=True,
+                     allow_redirects=False) as response:
+        response.raise_for_status()
+        if response.status_code != 200:
+            raise ValueError(f"HTTP {response.status_code}: se esperaba una respuesta directa.")
+        body, truncated = _read_capped_body(response, started_at)
+    if truncated:
+        raise ValueError("La respuesta del motor excede el límite de lectura.")
+    return body
+
+
+def _query_tor_taxi(session: requests.Session, query: str, max_results: int) -> list[dict[str, Any]]:
+    soup = BeautifulSoup(_fetch_engine_body(session, TOR_TAXI_URL, None), "html.parser")
+    terms = query.casefold().split()
+    rows = []
+    found_links = False
+    for link in soup.select("a[href]"):
+        url = link["href"]
+        if _onion_url_problem(url):
+            continue
+        found_links = True
+        title = link.get_text(" ", strip=True)
+        if title and all(term in f"{title} {url}".casefold() for term in terms):
+            rows.append({"onion_url": url, "title": title})
+    if not found_links:
+        raise ValueError("Tor Taxi no devolvió el directorio de enlaces .onion.")
+    return _normalize_engine_results(rows, "tor-taxi", max_results)
+
+
+def _normalize_engine_results(rows: list[Any], name: str, max_results: int) -> list[dict[str, Any]]:
+    results = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get("onion_url")
+        if not isinstance(url, str) or _onion_url_problem(url) or url in seen:
+            continue
+        target = urllib.parse.urlsplit(url)
+        if target.username is not None or target.password is not None:
+            continue
+        seen.add(url)
+        host = target.hostname or ""
+        title = str(row.get("title") or "Sin título")[:300]
+        snippet = str(row.get("snippet") or "")[:1000]
+        last_seen = str(row.get("last_seen") or "N/D")[:100]
+        results.append({
+            "onion_url": url, "onion_domain": host, "title": title, "snippet": snippet,
+            "last_seen": last_seen, "source_engine": name,
+            "reliability": _assess_reliability(title, snippet, last_seen, host),
+        })
+        if len(results) == max_results:
+            break
+    return results
+
+
 def search_onion_web(
     query: str,
     max_results: int = 20,
     days: int | None = None,
     local_only: bool = False,
+    engines: list[str] | None = None,
 ) -> dict[str, Any]:
     """
     Busca términos, actores o IoCs en servicios ocultos (.onion) mediante proxy SOCKS5h de Tor
@@ -1326,11 +1457,34 @@ def search_onion_web(
     # En SQLite un LIMIT negativo significa "sin límite", así que nunca se deja pasar.
     max_results = max(1, min(int(max_results), MAX_RESULTS_LIMIT))
     days = int(days) if days is not None and int(days) > 0 else None
+    extra_engines: dict[str, str] = {}
+    selected: list[str] = []
+    if not local_only:
+        try:
+            extra_engines = _configured_search_engines()
+            fresh_url = os.environ.get("ONION_FRESHONIONS_URL")
+            if fresh_url:
+                parsed = urllib.parse.urlsplit(fresh_url)
+                if (_onion_url_problem(fresh_url) or parsed.port == 0 or parsed.username is not None
+                        or parsed.query or parsed.fragment or parsed.path not in ("", "/", "/json")):
+                    raise ValueError("ONION_FRESHONIONS_URL debe apuntar a la raíz o a /json de una instancia .onion v3.")
+                extra_engines["freshonions"] = parsed._replace(path="/json").geturl()
+            available = ["ahmia", "tor-taxi", *extra_engines]
+            if engines is None:
+                selected = ["ahmia", *extra_engines]
+            elif (not isinstance(engines, list) or not engines
+                  or any(not isinstance(e, str) or e not in available for e in engines)):
+                raise ValueError(f"Motores disponibles: {', '.join(available)}.")
+            else:
+                selected = list(dict.fromkeys(engines))
+        except ValueError as exc:
+            return {"ok": False, "status": "invalid_arguments", "error": str(exc)}
 
     started_at = time.time()
     errors: list[str] = []
     results: list[dict[str, Any]] = []
     used_engine = "none"
+    engines_used: list[str] = []
     effective_proxy: str | None = None
     live_tor_reached = False
     spawned = False
@@ -1342,38 +1496,42 @@ def search_onion_web(
             session = _create_tor_session(proxy_url)
             effective_proxy = _resolve_effective_proxy(session, AHMIA_ONION_BASE)
 
-            # 1. Intentar servicio oculto .onion v3 nativo de Ahmia
-            try:
-                results = _query_ahmia(
-                    session,
-                    AHMIA_ONION_BASE,
-                    "ahmia_onion_v3",
-                    query,
-                    max_results=max_results,
-                    days=days,
-                )
-                live_tor_reached = True
-                used_engine = "ahmia_onion_v3 (SOCKS5h -> .onion)"
-            except Exception as e_onion:
-                errors.append(f"Ahmia .onion error: {e_onion}")
-
-            # 2. Fallback a la pasarela Ahmia saliendo por un nodo Tor, solo si falló el intento 1.
-            #    Ambos consultan el mismo índice: repetir una búsqueda que respondió con 0
-            #    resultados solo duplicaría la latencia.
-            if not live_tor_reached:
-                try:
-                    results = _query_ahmia(
-                        session,
-                        AHMIA_CLEAR_BASE,
-                        "ahmia_tor_exit",
-                        query,
-                        max_results=max_results,
-                        days=days,
-                    )
-                    live_tor_reached = True
-                    used_engine = "ahmia_tor_exit (SOCKS5h -> clearnet gateway)"
-                except Exception as e_clear:
-                    errors.append(f"Ahmia Tor exit error: {e_clear}")
+            batches = []
+            for engine in selected:
+                if engine == "ahmia":
+                    hits, source = _search_ahmia_with_fallback(session, query, max_results, days, errors)
+                    if source == "none":
+                        continue
+                else:
+                    try:
+                        if days is not None and engine in {"tor-taxi", "freshonions"}:
+                            errors.append(f"{engine}: no admite el filtro de antigüedad; se omitió.")
+                            continue
+                        if engine == "tor-taxi":
+                            hits = _query_tor_taxi(session, query, max_results)
+                        else:
+                            hits = _query_json_engine(session, extra_engines[engine], engine, query, max_results, days)
+                    except (ValueError, requests.RequestException) as exc:
+                        errors.append(f"{engine}: {exc}")
+                        continue
+                    source = engine
+                if used_engine == "none":
+                    used_engine = source
+                engines_used.append(engine)
+                batches.append(hits)
+            seen = set()
+            for rank in range(max((len(batch) for batch in batches), default=0)):
+                for batch in batches:
+                    if rank >= len(batch):
+                        continue
+                    hit = batch[rank]
+                    url = hit["onion_url"]
+                    if url not in seen and len(results) < max_results:
+                        results.append(hit)
+                        seen.add(url)
+                if len(results) >= max_results:
+                    break
+            live_tor_reached = bool(engines_used)
 
         except Exception as e_tor:
             errors.append(f"Tor SOCKS5 proxy error: {e_tor}")
@@ -1416,6 +1574,7 @@ def search_onion_web(
         "query": query,
         "proxy": effective_proxy or "unavailable",
         "engine_used": used_engine,
+        "engines_used": engines_used,
         "elapsed_seconds": round(time.time() - started_at, 2),
         "total_results": len(results),
         "live_results": live_count,
@@ -1562,6 +1721,7 @@ def read_onion_page(
     url: str,
     max_chars: int = 8000,
     verify_tls: bool = True,
+    window_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Realiza una lectura pasiva (HTTP GET) de una URL .onion a través del proxy SOCKS5h de Tor.
@@ -1595,6 +1755,10 @@ def read_onion_page(
             "error": f"read_onion_page solo acepta URLs http(s)://<direccion_v3>.onion válidas. {problem}",
         }
     max_chars = max(200, min(int(max_chars), MAX_CHARS_LIMIT))
+    try:
+        session_file = _window_session_file(window_id)
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_arguments", "error": str(exc)}
 
     started_at = time.time()
     spawned = False
@@ -1609,7 +1773,7 @@ def read_onion_page(
         session = _create_tor_session(proxy_url)
         effective_proxy = _resolve_effective_proxy(session, url)
         # Si el usuario resolvió un CAPTCHA o inició sesión en el navegador, esa sesión se reutiliza.
-        session_cookies = _apply_session_cookies(session, url)
+        session_cookies = _apply_session_cookies(session, url, session_file)
 
         # Las redirecciones se siguen a mano para validar cada salto ANTES de pedirlo:
         # un servicio .onion no debe poder dirigir la lectura hacia la web abierta.
@@ -1771,7 +1935,24 @@ def read_onion_page(
 #     la persona resuelva el CAPTCHA o inicie sesión; la sesión resultante (cookies) se guarda
 #     y la reutilizan tanto el navegador como `read_onion_page`.
 
-SESSION_FILE = Path(os.environ.get("ONION_SESSION_FILE", str(BASE_DIR / "onion_session.json")))
+def _default_session_file() -> Path:
+    agent_id = os.environ.get("ONION_AGENT_ID")
+    if agent_id is not None and not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", agent_id):
+        raise ValueError("ONION_AGENT_ID debe tener de 1 a 32 caracteres y usar minúsculas, números, guiones o _.")
+    if agent_id is not None:
+        return BASE_DIR / "onion_sessions" / agent_id / "onion_session.json"
+    return BASE_DIR / "onion_session.json"
+
+
+SESSION_FILE = Path(os.environ["ONION_SESSION_FILE"]) if "ONION_SESSION_FILE" in os.environ else _default_session_file()
+
+
+def _window_session_file(window_id: str | None) -> Path:
+    if window_id in (None, "default"):
+        return SESSION_FILE
+    if not isinstance(window_id, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", window_id):
+        raise ValueError("window_id debe tener de 1 a 32 caracteres y usar minúsculas, números, guiones o _.")
+    return SESSION_FILE.parent / (SESSION_FILE.name + ".windows") / window_id / "onion_session.json"
 BROWSER_NAV_TIMEOUT_MS = 60_000
 BROWSER_ACTION_TIMEOUT_MS = 20_000
 MAX_BROWSER_ACTIONS = 20
@@ -1825,10 +2006,10 @@ def _is_onion_cookie(cookie: Any) -> bool:
     )
 
 
-def _load_session_cookies() -> list[dict[str, Any]]:
+def _load_session_cookies(session_file: Path | None = None) -> list[dict[str, Any]]:
     """Cookies .onion vigentes guardadas por el navegador (formato de cookies de Playwright)."""
     try:
-        data = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+        data = json.loads((session_file or SESSION_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     raw = data.get("cookies") if isinstance(data, dict) else None
@@ -1844,30 +2025,36 @@ def _load_session_cookies() -> list[dict[str, Any]]:
     return cookies
 
 
-def _save_session_cookies(cookies: list[dict[str, Any]]) -> int:
+def _save_session_cookies(cookies: list[dict[str, Any]], session_file: Path | None = None) -> int:
     """Guarda solo cookies de dominios .onion. El fichero contiene sesiones: trátalo como un secreto."""
     onion_cookies = [c for c in cookies if _is_onion_cookie(c)]
     payload = {
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "cookies": onion_cookies,
     }
-    SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = SESSION_FILE.with_name(SESSION_FILE.name + ".tmp")
-    tmp_path.write_text(json.dumps(payload), encoding="utf-8")
-    with contextlib.suppress(OSError):
-        os.chmod(tmp_path, 0o600)
-    os.replace(tmp_path, SESSION_FILE)
+    session_file = session_file or SESSION_FILE
+    session_file.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".session-",
+                                     suffix=".tmp", dir=session_file.parent, delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        try:
+            json.dump(payload, tmp)
+            tmp.close()
+            os.replace(tmp_path, session_file)
+        finally:
+            tmp.close()
+            tmp_path.unlink(missing_ok=True)
     return len(onion_cookies)
 
 
-def _apply_session_cookies(session: requests.Session, url: str) -> int:
+def _apply_session_cookies(session: requests.Session, url: str, session_file: Path | None = None) -> int:
     """
     Carga en la sesión HTTP las cookies obtenidas en el navegador (p. ej. tras un traspaso al
     usuario) y devuelve cuántas corresponden al host de `url`.
     """
     host = (urllib.parse.urlparse(url).hostname or "").lower()
     matching = 0
-    for cookie in _load_session_cookies():
+    for cookie in _load_session_cookies(session_file):
         domain = str(cookie["domain"]).lower()
         expires = cookie.get("expires", -1)
         session.cookies.set_cookie(
@@ -1934,9 +2121,11 @@ class _OnionBrowser:
     visible funciona con normalidad mientras el servidor MCP espera el siguiente mensaje.
     """
 
-    def __init__(self, url_problem: Any = None, proxy_resolver: Any = None) -> None:
+    def __init__(self, url_problem: Any = None, proxy_resolver: Any = None,
+                 session_file: Path | None = None) -> None:
         self._url_problem = url_problem or _onion_url_problem
         self._proxy_resolver = proxy_resolver or self._tor_proxy_server
+        self.session_file = session_file
         self._call_lock = threading.Lock()
         self._cmds: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
@@ -1985,7 +2174,7 @@ class _OnionBrowser:
                 raise box["error"]
             return box["result"]
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Cierra el navegador guardando las cookies. Seguro aunque no se haya abierto nunca."""
         with self._call_lock:
             thread = self._thread
@@ -1993,9 +2182,10 @@ class _OnionBrowser:
                 self._cmds.put(None)
                 thread.join(timeout=20)
                 if thread.is_alive():
-                    return  # sigue atascado: el hilo es daemon y muere con el proceso
+                    return False  # el hilo sigue ocupado y puede guardar cookies al cerrarse
             self._thread = None
             self._pending = None
+            return True
 
     # ---- Hilo de trabajo -----------------------------------------------------------
 
@@ -2064,7 +2254,7 @@ class _OnionBrowser:
             self._visible = False
 
     def _save_cookies(self) -> int:
-        saved = _save_session_cookies(self._context.cookies())
+        saved = _save_session_cookies(self._context.cookies(), self.session_file)
         self._last_autosave = time.time()
         with contextlib.suppress(Exception):
             self.last_url = self._page.url
@@ -2110,7 +2300,7 @@ class _OnionBrowser:
         )
         self._context.set_default_timeout(BROWSER_ACTION_TIMEOUT_MS)
         self._context.set_default_navigation_timeout(BROWSER_NAV_TIMEOUT_MS)
-        saved = _load_session_cookies()
+        saved = _load_session_cookies(self.session_file)
         if saved:
             with contextlib.suppress(Exception):
                 self._context.add_cookies(saved)
@@ -2356,14 +2546,45 @@ class _OnionBrowser:
 
 
 _BROWSER = _OnionBrowser()
-atexit.register(_BROWSER.shutdown)
+_WINDOWS: dict[str, _OnionBrowser] = {}
+_WINDOWS_LOCK = threading.Lock()
+MAX_NAMED_WINDOWS = 8
 
 
-def _browser_call(op: str, **kwargs: Any) -> dict[str, Any]:
+def _browser_for(window_id: str | None, *, create: bool = False) -> _OnionBrowser | None:
+    if window_id in (None, "default"):
+        return _BROWSER
+    session_file = _window_session_file(window_id)
+    with _WINDOWS_LOCK:
+        browser = _WINDOWS.get(window_id)
+        if browser is None and create:
+            if len(_WINDOWS) >= MAX_NAMED_WINDOWS:
+                raise ValueError(f"Usa uno de los {MAX_NAMED_WINDOWS} identificadores ya asignados a este servidor.")
+            browser = _WINDOWS[window_id] = _OnionBrowser(session_file=session_file)
+        return browser
+
+
+def _shutdown_browsers() -> None:
+    with _WINDOWS_LOCK:
+        browsers = [_BROWSER, *_WINDOWS.values()]
+    for browser in browsers:
+        browser.shutdown()
+
+
+atexit.register(_shutdown_browsers)
+
+
+def _browser_call(op: str, *, window_id: str | None = None, **kwargs: Any) -> dict[str, Any]:
     """Ejecuta una operación del navegador y convierte cualquier fallo en una respuesta estructurada."""
     started_at = time.time()
     try:
-        result = _BROWSER.call(op, **kwargs)
+        browser = _browser_for(window_id, create=op == "open")
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_arguments", "error": str(exc)}
+    try:
+        if browser is None:
+            raise _BrowserClosed()
+        result = browser.call(op, **kwargs)
     except _BrowserUnavailable as exc:
         result = {
             "ok": False,
@@ -2373,18 +2594,18 @@ def _browser_call(op: str, **kwargs: Any) -> dict[str, Any]:
             "hint": BROWSER_INSTALL_HINT,
         }
     except _BrowserClosed:
-        saved = len(_load_session_cookies())
+        saved = len(_load_session_cookies(_window_session_file(window_id)))
         result = {
             "ok": False,
             "status": "browser_closed",
             "error_type": "browser_closed",
-            "closed_by_user": _BROWSER.closed_by_user,
-            "last_url": _BROWSER.last_url,
+            "closed_by_user": browser.closed_by_user if browser else False,
+            "last_url": browser.last_url if browser else None,
             "session_cookies_saved": saved,
             "error": "No hay ninguna página abierta en el navegador.",
             "hint": (
-                f"La sesión guardada conserva {saved} cookie(s). Continúa con read_onion_page(url) "
-                "o vuelve a abrir la página con onion_browser_open(url)."
+                f"La sesión guardada conserva {saved} cookie(s). Usa el mismo window_id "
+                "en read_onion_page o vuelve a abrir la página con onion_browser_open."
             ),
         }
     except _TorUnavailableError as exc:
@@ -2418,6 +2639,7 @@ def _browser_call(op: str, **kwargs: Any) -> dict[str, Any]:
             "error": (str(exc).strip().splitlines() or [type(exc).__name__])[0][:300],
         }
     result["elapsed_seconds"] = round(time.time() - started_at, 2)
+    result["window_id"] = window_id or "default"
     return result
 
 
@@ -2431,6 +2653,7 @@ def onion_browser_open(
     verify_tls: bool = True,
     max_chars: int = 8000,
     screenshot: bool = False,
+    window_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Abre una URL .onion en un navegador real (Firefox) sobre Tor y devuelve la página saneada.
@@ -2456,6 +2679,7 @@ def onion_browser_open(
         }
     result = _browser_call(
         "open",
+        window_id=window_id,
         url=url,
         visible=visible,
         verify_tls=bool(verify_tls),
@@ -2479,7 +2703,7 @@ def onion_browser_open(
         )
         result["next_step"] = (
             "Pide al usuario que complete el paso en la ventana. Cuando confirme, llama a "
-            "onion_browser_snapshot() para continuar desde donde lo dejó."
+            "onion_browser_snapshot con el mismo window_id para continuar desde donde lo dejó."
         )
     return result
 
@@ -2520,6 +2744,7 @@ def onion_browser_act(
     actions: list[dict[str, Any]],
     max_chars: int = 8000,
     screenshot: bool = False,
+    window_id: str | None = None,
 ) -> dict[str, Any]:
     """
     Ejecuta acciones del agente sobre la página abierta (rellenar campos, pulsar, elegir
@@ -2551,6 +2776,7 @@ def onion_browser_act(
         return {"ok": False, "status": "invalid_arguments", "error_type": "invalid_arguments", "error": str(exc)}
     return _browser_call(
         "act",
+        window_id=window_id,
         timeout=min(600.0, 90.0 + 30.0 * len(validated)),
         actions=validated,
         max_chars=_clamp_chars(max_chars),
@@ -2558,27 +2784,39 @@ def onion_browser_act(
     )
 
 
-def onion_browser_snapshot(max_chars: int = 8000, screenshot: bool = False) -> dict[str, Any]:
+def onion_browser_snapshot(max_chars: int = 8000, screenshot: bool = False,
+                           window_id: str | None = None) -> dict[str, Any]:
     """
     Devuelve el estado actual de la página abierta en el navegador (texto saneado, formularios,
     enlaces y, si se pide, una captura PNG). Es la forma de continuar después de que el usuario
     haya resuelto un CAPTCHA o iniciado sesión en la ventana visible.
     """
     return _browser_call(
-        "snapshot", timeout=60.0, max_chars=_clamp_chars(max_chars), screenshot=bool(screenshot)
+        "snapshot", window_id=window_id, timeout=60.0, max_chars=_clamp_chars(max_chars), screenshot=bool(screenshot)
     )
 
 
-def onion_browser_close(clear_session: bool = False) -> dict[str, Any]:
+def onion_browser_close(clear_session: bool = False, window_id: str | None = None) -> dict[str, Any]:
     """Cierra el navegador (guardando la sesión) y, con `clear_session=True`, borra las cookies guardadas."""
-    _BROWSER.shutdown()
-    kept = len(_load_session_cookies())
+    try:
+        browser = _browser_for(window_id)
+        session_file = _window_session_file(window_id)
+    except ValueError as exc:
+        return {"ok": False, "status": "invalid_arguments", "error": str(exc)}
+    if browser is not None and browser.shutdown() is False:
+        return {"ok": False, "status": "browser_busy", "window_id": window_id or "default",
+                "error": "El navegador sigue cerrándose. Repite la operación cuando termine."}
+    kept = len(_load_session_cookies(session_file))
     if clear_session:
-        with contextlib.suppress(OSError):
-            SESSION_FILE.unlink()
+        try:
+            session_file.unlink(missing_ok=True)
+        except OSError as exc:
+            return {"ok": False, "status": "session_clear_failed", "window_id": window_id or "default",
+                    "error": str(exc)}
     return {
         "ok": True,
         "status": "closed",
+        "window_id": window_id or "default",
         "session_cleared": bool(clear_session),
         "session_cookies_saved": 0 if clear_session else kept,
     }
@@ -2658,6 +2896,7 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
     args = arguments or {}
     if not isinstance(args, dict):
         raise ValueError("Los argumentos de la herramienta deben ser un objeto JSON.")
+    window = {"window_id": args["window_id"]} if "window_id" in args else {}
 
     if name == "search_onion_web":
         return search_onion_web(
@@ -2665,12 +2904,14 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
             max_results=_as_int(args.get("max_results"), 20, "max_results") or 20,
             days=_as_int(args.get("days"), None, "days"),
             local_only=_as_bool(args.get("local_only"), False),
+            **({"engines": args["engines"]} if "engines" in args else {}),
         )
     if name == "read_onion_page":
         return read_onion_page(
             url=str(args.get("url") or ""),
             max_chars=_as_int(args.get("max_chars"), 8000, "max_chars") or 8000,
             verify_tls=_as_bool(args.get("verify_tls"), True),
+            **window,
         )
     if name == "check_tor_status":
         return check_tor_status()
@@ -2682,20 +2923,23 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
             verify_tls=_as_bool(args.get("verify_tls"), True),
             max_chars=_as_int(args.get("max_chars"), 8000, "max_chars") or 8000,
             screenshot=_as_bool(args.get("screenshot"), False),
+            **window,
         )
     if name == "onion_browser_act":
         return onion_browser_act(
             actions=args.get("actions"),
             max_chars=_as_int(args.get("max_chars"), 8000, "max_chars") or 8000,
             screenshot=_as_bool(args.get("screenshot"), False),
+            **window,
         )
     if name == "onion_browser_snapshot":
         return onion_browser_snapshot(
             max_chars=_as_int(args.get("max_chars"), 8000, "max_chars") or 8000,
             screenshot=_as_bool(args.get("screenshot"), False),
+            **window,
         )
     if name == "onion_browser_close":
-        return onion_browser_close(clear_session=_as_bool(args.get("clear_session"), False))
+        return onion_browser_close(clear_session=_as_bool(args.get("clear_session"), False), **window)
     raise ValueError(f"Herramienta desconocida: {name}")
 
 
@@ -2847,7 +3091,7 @@ def run_native_python_mcp_server() -> None:
     except (BrokenPipeError, KeyboardInterrupt):
         pass  # el cliente cerró la conexión
     finally:
-        _BROWSER.shutdown()  # cierra el navegador (si se abrió) guardando la sesión
+        _shutdown_browsers()
 
 
 def main() -> None:
@@ -2862,6 +3106,7 @@ def main() -> None:
     p_search.add_argument("query", help="Término de búsqueda o IoC")
     p_search.add_argument("--max-results", type=int, default=20, help="1-50 (por defecto 20)")
     p_search.add_argument("--days", type=int, default=None, help="Antigüedad máxima en días")
+    p_search.add_argument("--engine", action="append", help="Nombre del motor. Repite para combinar varios.")
     p_search.add_argument(
         "--local-only",
         action="store_true",
@@ -2910,6 +3155,7 @@ def main() -> None:
             max_results=args.max_results,
             days=args.days,
             local_only=args.local_only,
+            engines=args.engine,
         )
     elif args.cmd == "handoff":
         out = run_user_handoff(args.url, timeout_sec=args.timeout, verify_tls=not args.no_verify_tls)

@@ -53,6 +53,23 @@ Mira el campo `status` al leer el JSON:
 
 El CLI devuelve JSON por la salida estándar y sale con código `1` cuando `ok` es `false`.
 
+### Añadir motores de búsqueda
+
+- **Tor Taxi** viene integrado como directorio. `--engine tor-taxi` descarga su portada por Tor y filtra sus enlaces por nombre o dirección. Sirve para encontrar sitios, sin buscar dentro de ellos. Por ejemplo, `python search_onion_web.py search "Tor Project" --engine tor-taxi`. [Tor Taxi](https://tor.taxi/)
+- **FreshOnions Reborn** admite búsqueda a través de su endpoint nativo `/json`. Define `ONION_FRESHONIONS_URL` con la URL `.onion` v3 de tu instancia y elige `--engine freshonions`. [FreshOnions Reborn](https://github.com/hardcod3dd/freshonions-torscraper-reborn)
+
+El filtro `--days` omite Tor Taxi y FreshOnions porque esos adaptadores no aplican un filtro de antigüedad.
+
+Ahmia funciona sin configuración. Para conectar hasta cinco indexadores adicionales, define `ONION_SEARCH_ENGINES` en el entorno del servidor MCP con un objeto JSON que asigna cada nombre a su endpoint `.onion` v3. Sustituye `<direccion_v3>` por la dirección del indexador que quieras conectar.
+
+```json
+{"archivo": "http://<direccion_v3>.onion/api/search"}
+```
+
+El endpoint recibe un GET con `q`, `limit` y, si se indica, `days`. Debe devolver `{"results": [...]}` con un campo `onion_url` en cada resultado. También puede incluir `title`, `snippet` y `last_seen`. Si el buscador ofrece otro formato, hace falta un adaptador que exponga ese contrato. Las consultas salen por Tor y los endpoints adicionales deben responder directamente, sin redirecciones.
+
+Por defecto se consulta Ahmia y los motores configurados por el operador. Puedes elegirlos con `engines: ["ahmia", "tor-taxi"]` en MCP o con `--engine ahmia --engine tor-taxi` en la terminal. El MCP intercala resultados y elimina URLs repetidas. `engines_used` indica qué motores respondieron, y cada resultado conserva su `source_engine`.
+
 ## Conectar un cliente MCP
 
 Inicia el servidor por stdio con el mismo Python donde instalaste las dependencias. Para clientes que usan `mcpServers`, la configuración es:
@@ -98,6 +115,12 @@ python search_onion_web.py handoff "http://2gzyxa5ihm7nsggfxnu52rck2vv4rvmdlkiu3
 
 Firefox usa el proxy de Tor, pero tiene una huella distinta de Tor Browser. JavaScript está desactivado por defecto. `onion_session.json` contiene cookies que pueden dar acceso a sesiones iniciadas. Está en `.gitignore`: mantenlo fuera de informes y repositorios.
 
+### Varios agentes y ventanas
+
+En un mismo servidor MCP puedes abrir varias ventanas con nombres distintos. Usa, por ejemplo, `window_id: "fuentes"` en `onion_browser_open` con `visible: true`. Repite con `window_id: "contraste"` para abrir otra ventana. Pasa el mismo nombre al consultar una captura, interactuar, cerrar o reutilizar sus cookies desde `read_onion_page`. Cada ventana conserva sus propias cookies. Hay una ventana principal y hasta ocho identificadores adicionales por servidor.
+
+Si cada agente usa su propio servidor MCP, pon un `ONION_AGENT_ID` distinto en el entorno de cada proceso, por ejemplo `analista-a` y `analista-b`. Así cada proceso conserva sus ventanas y cookies por separado. Si defines `ONION_SESSION_FILE`, usa una ruta distinta por agente: esa opción sustituye la ruta calculada a partir del ID. Los clientes lanzan los agentes y el MCP les da acceso a las herramientas.
+
 ## Docker
 
 La imagen incluye Tor y cubre la búsqueda y el lector pasivo. El modo navegador se instala en el equipo de escritorio.
@@ -122,6 +145,8 @@ El contenedor inicia el servidor MCP por stdio. El volumen conserva el índice y
 | `ONION_ALLOW_INTERACTION` | Con `1`, habilita `onion_browser_act`. |
 | `ONION_BROWSER_JAVASCRIPT` | Con `1`, activa JavaScript en Firefox. |
 | `ONION_SESSION_FILE` | Ruta al archivo de cookies. Por defecto, `onion_session.json` junto al script. |
+| `ONION_AGENT_ID` | Separa las cookies por agente en `onion_sessions/<id>/`. |
+| `ONION_SEARCH_ENGINES` | Objeto JSON con endpoints adicionales de búsqueda. |
 
 El lector pasivo valida las direcciones `.onion` v3, sigue hasta cinco redirecciones dentro de `.onion` y quita scripts, formularios y elementos ocultos del texto. En el modo navegador, Firefox puede llegar a solicitar por Tor el destino de una redirección HTTP fuera de `.onion` antes de que la herramienta descarte la página.
 

@@ -96,6 +96,62 @@ class OnionTestCase(unittest.TestCase):
 
 
 class TestOnionOsint(OnionTestCase):
+    def test_tor_taxi_filters_directory_locally(self):
+        body = f'<a href="http://{TOR_ONION}/">The Tor Project</a><a href="http://{DREAD_ONION}/">Other</a>'
+        response = fake_response(oom.TOR_TAXI_URL, body.encode())
+        response.__enter__.return_value = response
+        session = fake_session(response)
+        with tor_session(session), patch.dict(os.environ, {"ONION_SEARCH_ENGINES": "{}", "ONION_FRESHONIONS_URL": ""}):
+            result = oom.search_onion_web("tor project", engines=["tor-taxi"])
+        self.assertEqual(result["engines_used"], ["tor-taxi"])
+        self.assertEqual([row["title"] for row in result["results"]], ["The Tor Project"])
+        self.assertIsNone(session.get.call_args.kwargs["params"])
+
+    def test_freshonions_uses_native_json(self):
+        base = f"http://{TOR_ONION}"
+        response = fake_response(base + "/json", json.dumps({"results": [
+            {"url": base + "/about", "title": "About", "fragment": "<b>Privacy</b>"},
+        ]}).encode())
+        response.__enter__.return_value = response
+        session = fake_session(response)
+        with tor_session(session), patch.dict(os.environ, {"ONION_FRESHONIONS_URL": base}):
+            result = oom.search_onion_web("privacy", engines=["freshonions"])
+        self.assertEqual(result["engines_used"], ["freshonions"])
+        self.assertEqual(result["results"][0]["snippet"], "Privacy")
+        self.assertEqual(session.get.call_args.args[0], base + "/json")
+        self.assertEqual(session.get.call_args.kwargs["params"], {"search": "privacy"})
+
+    def test_configured_indexer_combines_results_and_keeps_sources(self):
+        endpoint = f"http://{AHMIA_ONION}/api/search"
+        shared = self.record(path="/shared")
+        unique = self.record(path="/unique")
+        response = fake_response(endpoint, json.dumps({"results": [
+            shared, {"onion_url": "https://example.org/"}, unique,
+        ]}).encode())
+        response.__enter__.return_value = response
+        session = fake_session(response)
+        with tor_session(session), patch.object(oom, "_query_ahmia", return_value=[shared]), \
+             patch.dict(os.environ, {"ONION_SEARCH_ENGINES": json.dumps({"archivo": endpoint})}):
+            result = oom.call_tool("search_onion_web", {
+                "query": "privacy", "max_results": 2, "engines": ["ahmia", "archivo"],
+            })
+        self.assertEqual(result["engines_used"], ["ahmia", "archivo"])
+        self.assertEqual([r["onion_url"] for r in result["results"]], [
+            shared["onion_url"], unique["onion_url"],
+        ])
+        self.assertEqual(result["results"][1]["source_engine"], "archivo")
+        session.get.assert_called_once_with(
+            endpoint, params={"q": "privacy", "limit": 2}, timeout=(10, 20),
+            stream=True, allow_redirects=False,
+        )
+
+    def test_invalid_indexer_selection_does_not_connect(self):
+        with patch.dict(os.environ, {"ONION_SEARCH_ENGINES": "{}"}), \
+             patch.object(oom, "ensure_tor_proxy") as tor:
+            result = oom.search_onion_web("privacy", engines=["unknown"])
+        self.assertEqual(result["status"], "invalid_arguments")
+        tor.assert_not_called()
+
     def test_tor_proxy_overrides_environment_proxies(self) -> None:
         """Verifica que HTTP_PROXY/HTTPS_PROXY/NO_PROXY del entorno nunca pisen el proxy SOCKS5h de Tor."""
         env_overrides = {
@@ -704,6 +760,30 @@ class TestMcpServerAndDispatcher(unittest.TestCase):
 
 
 class TestBrowserModeUnit(OnionTestCase):
+    def test_named_windows_route_calls_and_isolate_cookie_files(self):
+        url = f"http://{TOR_ONION}/"
+        with patch.object(oom, "_WINDOWS", {}), patch.object(
+            oom._OnionBrowser, "call", autospec=True,
+            side_effect=lambda browser, op, **kwargs: {
+                "ok": True, "status": "completed", "mode": "visible",
+            },
+        ) as invoke:
+            a = oom.call_tool("onion_browser_open", {"url": url, "visible": True, "window_id": "fuentes"})
+            b = oom.call_tool("onion_browser_open", {"url": url, "visible": True, "window_id": "contraste"})
+            oom.call_tool("onion_browser_snapshot", {"window_id": "fuentes"})
+            first, second, snapshot = [c.args[0] for c in invoke.call_args_list]
+            self.assertIs(first, snapshot)
+            self.assertIsNot(first, second)
+            self.assertEqual((a["window_id"], b["window_id"]), ("fuentes", "contraste"))
+            for browser, value in ((first, "one"), (second, "two")):
+                oom._save_session_cookies([
+                    {"domain": TOR_ONION, "path": "/", "name": "sid", "value": value},
+                ], browser.session_file)
+            oom.call_tool("onion_browser_close", {"window_id": "fuentes", "clear_session": True})
+            self.assertEqual(oom._load_session_cookies(first.session_file), [])
+            self.assertEqual(oom._load_session_cookies(second.session_file)[0]["value"], "two")
+            self.assertEqual(oom.onion_browser_snapshot(window_id="../escape")["status"], "invalid_arguments")
+
     """Modo navegador sin lanzar ningún navegador: validaciones, sesión y traspaso."""
 
     LOGIN_HTML = (

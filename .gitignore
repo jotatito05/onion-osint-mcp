@@ -19,6 +19,9 @@ onion_index.db-shm
 # Cookies de sesión del modo navegador (son credenciales: nunca al repositorio)
 onion_session.json
 onion_session.json.tmp
+onion_sessions/
+*.windows/
+.session-*.tmp
 tor-osint-data/
 .env
 *.log
