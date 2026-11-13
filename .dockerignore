@@ -1,0 +1,13 @@
+.git
+.github
+node_modules
+__pycache__
+*.py[cod]
+.venv
+venv
+tests
+examples
+onion_index.db*
+onion_session.json*
+*.log
+.env

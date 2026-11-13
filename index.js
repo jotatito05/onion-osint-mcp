@@ -1,14 +1,17 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { z } from "zod";
-import { execFile, execFileSync } from "node:child_process";
-import { promisify } from "node:util";
+#!/usr/bin/env node
+// Lanzador Node.js del servidor MCP.
+//
+// El servidor MCP real es `search_onion_web.py mcp` (Python puro, JSON-RPC sobre stdio). Este
+// script solo localiza un intérprete de Python que tenga las dependencias instaladas y lo
+// arranca conectándolo directamente a la entrada/salida del cliente MCP. Así las herramientas
+// se definen en un único sitio y el proceso de Python vive toda la sesión, que es lo que
+// permite mantener abierto el navegador entre llamadas (onion_browser_*).
+import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SCRIPT_PATH = path.join(__dirname, "search_onion_web.py");
 
@@ -20,16 +23,17 @@ function resolvePythonExecutable() {
   const candidates = ["python3", "python"];
   if (process.platform === "win32") {
     const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
-    for (const ver of ["Python313", "Python312", "Python311", "Python310"]) {
+    for (const ver of ["Python310", "Python311", "Python312", "Python313", "Python314"]) {
       candidates.unshift(path.join(localAppData, "Programs", "Python", ver, "python.exe"));
     }
   }
 
+  // Se elige el primer intérprete que realmente tenga las dependencias instaladas.
   for (const bin of candidates) {
     try {
       execFileSync(bin, ["-c", "import requests, socks, bs4"], {
         stdio: "ignore",
-        timeout: 4000,
+        timeout: 8000,
         windowsHide: true,
       });
       return bin;
@@ -37,97 +41,32 @@ function resolvePythonExecutable() {
       // Siguiente candidato
     }
   }
-  return process.platform === "win32" ? "python" : "python3";
+  return null;
 }
 
-const PYTHON_EXE = resolvePythonExecutable();
+const pythonExe = resolvePythonExecutable();
+if (!pythonExe) {
+  // stdout está reservado al protocolo MCP: los diagnósticos van siempre por stderr.
+  console.error(
+    "onion-osint-mcp: no se encontró un intérprete de Python con requests, PySocks y beautifulsoup4.\n" +
+      "Instala las dependencias (pip install -r requirements.txt) o define PYTHON_EXE con la ruta del intérprete."
+  );
+  process.exit(1);
+}
 
-const server = new McpServer({
-  name: "onion-osint",
-  version: "1.3.0",
+const child = spawn(pythonExe, [SCRIPT_PATH, "mcp"], {
+  stdio: "inherit",
+  env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
+  windowsHide: true,
 });
 
-async function runPythonTool(args) {
-  try {
-    const { stdout } = await execFileAsync(PYTHON_EXE, [SCRIPT_PATH, ...args], {
-      timeout: 90000,
-      maxBuffer: 10 * 1024 * 1024,
-      encoding: "utf8",
-      env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1" },
-      windowsHide: true,
-    });
-    const trimmed = stdout.trim();
-    let isError = false;
-    try {
-      const parsed = JSON.parse(trimmed);
-      if (parsed && parsed.ok === false) {
-        isError = true;
-      }
-    } catch {
-      // Si la salida no es JSON válido, conservar texto
-    }
-    return {
-      isError,
-      content: [{ type: "text", text: trimmed }],
-    };
-  } catch (err) {
-    return {
-      isError: true,
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            {
-              ok: false,
-              status: "connection_failed",
-              error: String(err.message || err),
-              stderr: err.stderr ? String(err.stderr) : undefined,
-            },
-            null,
-            2
-          ),
-        },
-      ],
-    };
-  }
+child.on("error", (err) => {
+  console.error(`onion-osint-mcp: no se pudo iniciar Python (${pythonExe}): ${err.message}`);
+  process.exit(1);
+});
+child.on("exit", (code, signal) => {
+  process.exit(signal ? 1 : code ?? 0);
+});
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => child.kill(sig));
 }
-
-server.tool(
-  "search_onion_web",
-  "Busca información pública, foros, documentación o menciones en servicios ocultos (.onion) de la red Tor a través de proxy SOCKS5h (Ahmia .onion + base de datos indexada local SQLite). Distingue en 'status' entre 'completed', 'local_only' y 'connection_failed'.",
-  {
-    query: z.string().describe("Término de búsqueda, actor de amenaza, CVE o IoC a consultar en la red Tor (.onion)"),
-    max_results: z.number().int().min(1).max(50).optional().describe("Número máximo de resultados a devolver (por defecto 20)"),
-    days: z.number().int().min(1).max(365).optional().describe("Filtro opcional de antigüedad máxima en días (ej. 7 o 30)"),
-    local_only: z.boolean().optional().describe("Si es true, consulta únicamente la base de datos SQLite indexada local sin conectar a Tor"),
-  },
-  async ({ query, max_results, days, local_only }) => {
-    const cliArgs = ["search", query, "--max-results", String(max_results || 20)];
-    if (days) {
-      cliArgs.push("--days", String(days));
-    }
-    if (local_only) {
-      cliArgs.push("--local-only");
-    }
-    return runPythonTool(cliArgs);
-  }
-);
-
-server.tool(
-  "read_onion_page",
-  "Realiza una lectura pasiva (HTTP GET) de una URL .onion a través del proxy SOCKS5h de Tor, eliminando scripts y formularios de credenciales por seguridad OSINT. Distingue en 'status' entre 'completed', 'tls_error' (certificado autofirmado), 'timeout' y 'connection_failed'.",
-  {
-    url: z.string().describe("URL completa http(s)://<v3_address>.onion/..."),
-    max_chars: z.number().int().min(500).max(25000).optional().describe("Longitud máxima del texto extraído (por defecto 8000)"),
-    verify_tls: z.boolean().optional().describe("Por defecto true (reporta 'tls_error' ante certificados autofirmados). Si es false, permite leer servicios .onion con certificado HTTPS autofirmado."),
-  },
-  async ({ url, max_chars, verify_tls }) => {
-    const cliArgs = ["read", url, "--max-chars", String(max_chars || 8000)];
-    if (verify_tls === false) {
-      cliArgs.push("--no-verify-tls");
-    }
-    return runPythonTool(cliArgs);
-  }
-);
-
-await server.connect(new StdioServerTransport());

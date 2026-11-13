@@ -9,12 +9,16 @@ env/
 dist/
 build/
 *.egg-info/
+.pytest_cache/
 
 # Datos locales de Tor y base de datos indexada local
 onion_index.db
 onion_index.db-journal
 onion_index.db-wal
 onion_index.db-shm
+# Cookies de sesión del modo navegador (son credenciales: nunca al repositorio)
+onion_session.json
+onion_session.json.tmp
 tor-osint-data/
 .env
 *.log

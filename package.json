@@ -1,15 +1,38 @@
 {
   "name": "onion-osint-mcp",
-  "version": "1.0.0",
-  "description": "MCP Server for Tor (.onion) OSINT & Threat Intelligence via SOCKS5 Proxy",
+  "version": "1.5.0",
+  "description": "Node.js launcher for the onion-osint MCP server (Tor .onion OSINT & Threat Intelligence, implemented in Python)",
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
+  "bin": {
+    "onion-osint-mcp": "index.js"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "zod": "^3.23.8"
-  }
+  "files": [
+    "index.js",
+    "search_onion_web.py",
+    "requirements.txt",
+    "SKILL.md",
+    "AGENTS.md"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js",
+    "test": "python -m unittest discover -s tests -v"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jotatito05/onion-osint-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "osint",
+    "tor",
+    "onion",
+    "threat-intelligence",
+    "cti"
+  ]
 }
-

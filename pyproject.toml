@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onion-osint-mcp"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Universal Tor (.onion) OSINT & Threat Intelligence Tool and MCP Server for Agentic AI"
 readme = "README.md"
 license = { text = "MIT" }
@@ -13,11 +13,29 @@ authors = [
   { name = "JotaTito05", email = "jtiobar01@gmail.com" }
 ]
 keywords = ["osint", "tor", "onion", "cybersecurity", "threat-intelligence", "mcp", "ai-agents", "cti"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Security",
+]
 dependencies = [
   "requests>=2.31.0",
   "PySocks>=1.7.1",
   "beautifulsoup4>=4.12.0",
 ]
+
+[project.optional-dependencies]
+# Modo navegador (interacción y traspaso al usuario). Después: python -m playwright install firefox
+browser = ["playwright>=1.45"]
+
+[project.urls]
+Homepage = "https://github.com/jotatito05/onion-osint-mcp"
+Issues = "https://github.com/jotatito05/onion-osint-mcp/issues"
 
 [project.scripts]
 onion-osint = "search_onion_web:main"
@@ -25,3 +43,6 @@ onion-osint = "search_onion_web:main"
 [tool.setuptools]
 py-modules = ["search_onion_web"]
 
+# Fuente única de la versión: `__version__` en search_onion_web.py
+[tool.setuptools.dynamic]
+version = { attr = "search_onion_web.__version__" }
